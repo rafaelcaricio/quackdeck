@@ -1,13 +1,25 @@
 import SwiftUI
 
 struct LandscapeHudOverlay: View {
+    private enum ActiveHudPanel: Equatable {
+        case tof
+        case emotions
+    }
+
     let appState: AppState
     @Binding var isSensorsDrawerOpen: Bool
     var drawerWidth: CGFloat = 0
+    var stageWidth: CGFloat = 852
 
-    @State private var showTofControls: Bool = false
+    @State private var activePanel: ActiveHudPanel?
+    @AccessibilityFocusState private var emoteAccessibilityFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let hasKicks = appState.canShowKicks
+        let remainingWidth = max(0, stageWidth - 24 - 128 - 220 - 32)
+        let fitsCompactL2Row = remainingWidth >= 220
+
         VStack(spacing: 8) {
             // Top floating pill bar
             HStack(spacing: 10) {
@@ -31,19 +43,28 @@ struct LandscapeHudOverlay: View {
                 .layoutPriority(2)
             }
 
-            if showTofControls && appState.isConnected {
+            if activePanel == .tof && appState.isConnected {
                 TofOverlayControlsBar(appState: appState) {
-                    withAnimation(.spring(response: 0.24, dampingFraction: 0.85)) {
-                        showTofControls = false
-                    }
+                    closePanels(restoreEmoteFocus: false)
                 }
                 .frame(maxWidth: 300)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
 
             if appState.motorThermalLevel != .normal, let banner = appState.thermalBannerText {
                 ThermalCautionBanner(level: appState.motorThermalLevel, message: banner)
                     .frame(maxWidth: 420)
+            }
+
+            if appState.displayedActiveKickSide != nil || appState.activeEmotionName != nil || appState.emotionStatusNote != nil {
+                ActiveEmotionBadgePill(
+                    activeKickSide: appState.displayedActiveKickSide,
+                    emotionName: appState.activeEmotionName,
+                    endsAt: appState.activeEmotionEndsAt,
+                    showCountdown: appState.activeEmotionDurationKnown,
+                    statusNote: appState.emotionStatusNote
+                )
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
 
             Spacer(minLength: 0)
@@ -78,7 +99,7 @@ struct LandscapeHudOverlay: View {
                         appState: appState,
                         style: .landscapePill,
                         onOpenSensors: {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                            withAnimation(reduceMotion ? .none : .spring(response: 0.28, dampingFraction: 0.85)) {
                                 isSensorsDrawerOpen = true
                             }
                         }
@@ -88,36 +109,189 @@ struct LandscapeHudOverlay: View {
 
                 Spacer(minLength: 4)
 
-                // Right thumb: Look Center + QUACK + Turn rocker (hidden behind drawer if open)
+                // Right thumb: Emote + Center + QUACK + L2 Kick pair beside Turn rocker
                 if isSensorsDrawerOpen {
                     Color.clear
                         .frame(width: drawerWidth + 4, height: 1)
                 } else if appState.canLook || appState.canDrive {
-                    VStack(alignment: .trailing, spacing: 12) {
-                        if appState.canLook {
-                            HStack(spacing: 12) {
-                                lookCenterButton
-                                quackButton
-                            }
-                        }
-
-                        if appState.canDrive {
-                            TurnRockerView(appState: appState, style: .landscapePill)
-                        }
-                    }
-                    .transition(.opacity)
+                    trailingActionCluster(hasKicks: hasKicks, fitsCompactRow: fitsCompactL2Row)
+                        .transition(.opacity)
                 }
             }
         }
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 12)
-        .animation(.easeOut(duration: 0.2), value: appState.cockpitState)
-        .onChange(of: appState.isConnected) { _, connected in
-            if !connected {
-                showTofControls = false
+        .overlay(alignment: .bottomTrailing) {
+            if activePanel == .emotions && appState.canTriggerEmotions && !isSensorsDrawerOpen {
+                EmotionsPickerPanel(
+                    emotions: appState.availableEmotions,
+                    activeEmotionName: appState.activeEmotionName,
+                    columns: 4,
+                    onSelect: { name in
+                        closePanels(restoreEmoteFocus: false)
+                        Task {
+                            await appState.triggerEmotion(name)
+                        }
+                    },
+                    onClose: {
+                        closePanels(restoreEmoteFocus: true)
+                    }
+                )
+                .frame(maxWidth: 368)
+                .padding(.trailing, 12)
+                .padding(.bottom, appState.canDrive ? 118 : 68)
+                .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .animation(reduceMotion ? .none : .easeOut(duration: 0.2), value: appState.layoutCockpitState)
+        .onChange(of: appState.isConnected) { _, connected in
+            if !connected {
+                activePanel = nil
+            }
+        }
+        .onChange(of: appState.canTriggerEmotions) { _, canTrigger in
+            if !canTrigger && activePanel == .emotions {
+                activePanel = nil
+            }
+        }
+        .onChange(of: isSensorsDrawerOpen) { _, open in
+            if open && activePanel == .emotions {
+                activePanel = nil
+            }
+        }
+        .onDisappear {
+            appState.stopAllMotion()
+        }
+    }
+
+    @ViewBuilder
+    private func trailingActionCluster(hasKicks: Bool, fitsCompactRow: Bool) -> some View {
+        VStack(alignment: .trailing, spacing: 10) {
+            if appState.canLook {
+                if hasKicks {
+                    HStack(spacing: 8) {
+                        if appState.canTriggerEmotions {
+                            emoteCompactButton
+                        }
+                        lookCenterCompactButton
+                        quackCalmPillButton
+                    }
+                } else {
+                    HStack(spacing: 10) {
+                        if appState.canTriggerEmotions {
+                            emoteCircleButton
+                        }
+                        lookCenterButton
+                        quackButton
+                    }
+                }
+            }
+
+            if appState.canDrive {
+                if hasKicks && fitsCompactRow {
+                    HStack(spacing: 12) {
+                        KickPairButtons(appState: appState, style: .landscapeCompact)
+                        TurnRockerView(appState: appState, style: .landscapeCompact)
+                    }
+                } else if hasKicks {
+                    VStack(alignment: .trailing, spacing: 8) {
+                        KickPairButtons(appState: appState, style: .landscapeCompact)
+                        TurnRockerView(appState: appState, style: .landscapeCompact)
+                    }
+                } else {
+                    TurnRockerView(appState: appState, style: .landscapePill)
+                }
+            }
+        }
+    }
+
+    private func closePanels(restoreEmoteFocus: Bool) {
+        withAnimation(reduceMotion ? .none : .spring(response: 0.24, dampingFraction: 0.85)) {
+            activePanel = nil
+        }
+        if restoreEmoteFocus {
+            Task { @MainActor in
+                emoteAccessibilityFocused = true
+            }
+        }
+    }
+
+    private var emoteCompactButton: some View {
+        let isHighlighted = activePanel == .emotions || appState.activeEmotionName != nil
+        return Button {
+            QuackHaptics.light()
+            withAnimation(reduceMotion ? .none : .spring(response: 0.24, dampingFraction: 0.85)) {
+                activePanel = (activePanel == .emotions) ? nil : .emotions
+            }
+        } label: {
+            Image(systemName: QuackIcon.emotions)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(QuackTheme.duckOrange)
+                .frame(width: 48, height: QuackTheme.minTouchTarget)
+                .quackGlassPill(borderColor: QuackTheme.duckOrange.opacity(isHighlighted ? 0.9 : 0.45))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.quackTouch)
+        .accessibilityFocused($emoteAccessibilityFocused)
+        .accessibilityLabel("Emotions")
+    }
+
+    private var lookCenterCompactButton: some View {
+        Button {
+            appState.lookCenter()
+        } label: {
+            Image(systemName: QuackIcon.lookCenter)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(QuackTheme.acidCyan)
+                .frame(width: 48, height: QuackTheme.minTouchTarget)
+                .quackGlassPill(borderColor: QuackTheme.acidCyan.opacity(0.45))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.quackTouch)
+        .accessibilityLabel("Look Center")
+    }
+
+    private var quackCalmPillButton: some View {
+        Button {
+            Task {
+                await appState.playQuack()
+            }
+        } label: {
+            Text("QUACK")
+                .font(QuackTheme.condensedDisplay(size: 15))
+                .foregroundStyle(QuackTheme.creamText)
+                .frame(width: 68, height: QuackTheme.minTouchTarget)
+                .quackGlassPill(borderColor: QuackTheme.subtleBorder)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.quackTouch)
+    }
+
+    private var emoteCircleButton: some View {
+        let isHighlighted = activePanel == .emotions || appState.activeEmotionName != nil
+        return Button {
+            QuackHaptics.light()
+            withAnimation(reduceMotion ? .none : .spring(response: 0.24, dampingFraction: 0.85)) {
+                activePanel = (activePanel == .emotions) ? nil : .emotions
+            }
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: QuackIcon.emotions)
+                    .font(.system(size: 16, weight: .semibold))
+                Text("Emote")
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(QuackTheme.duckOrange)
+            .frame(width: 56, height: 56)
+            .quackGlassPill(borderColor: QuackTheme.duckOrange.opacity(isHighlighted ? 0.9 : 0.45))
+            .contentShape(Circle())
+        }
+        .buttonStyle(.quackTouch)
+        .accessibilityFocused($emoteAccessibilityFocused)
+        .accessibilityLabel("Emotions")
     }
 
     private var lookCenterButton: some View {
@@ -131,7 +305,7 @@ struct LandscapeHudOverlay: View {
                     .font(.system(size: 12, weight: .semibold))
             }
             .foregroundStyle(QuackTheme.acidCyan)
-            .frame(width: 64, height: 64)
+            .frame(width: 60, height: 60)
             .quackGlassPill(borderColor: QuackTheme.acidCyan.opacity(0.45))
             .contentShape(Circle())
         }
@@ -146,9 +320,9 @@ struct LandscapeHudOverlay: View {
             }
         } label: {
             Text("QUACK")
-                .font(QuackTheme.condensedDisplay(size: 18))
+                .font(QuackTheme.condensedDisplay(size: 17))
                 .foregroundStyle(QuackTheme.inkSurface)
-                .frame(width: 72, height: 72)
+                .frame(width: 68, height: 68)
                 .background(
                     Circle()
                         .fill(QuackTheme.warnYellow)
@@ -169,7 +343,7 @@ struct LandscapeHudOverlay: View {
             if let pr = appState.telemetry.bodyPitchRollDegrees {
                 return String(format: "%+.1f°", pr.pitch)
             }
-            return "+0.0°"
+            return "—°"
         }()
         let tempText = appState.telemetry.hottestServoTempC.map { String(format: "%.0f°C", $0) } ?? "--°C"
         let tempColor: Color = {
@@ -229,8 +403,8 @@ struct LandscapeHudOverlay: View {
         return HStack(spacing: 0) {
             Button {
                 QuackHaptics.light()
-                withAnimation(.spring(response: 0.24, dampingFraction: 0.85)) {
-                    showTofControls.toggle()
+                withAnimation(reduceMotion ? .none : .spring(response: 0.24, dampingFraction: 0.85)) {
+                    activePanel = (activePanel == .tof) ? nil : .tof
                 }
             } label: {
                 HStack(spacing: 6) {
@@ -241,7 +415,7 @@ struct LandscapeHudOverlay: View {
                         .foregroundStyle(QuackTheme.acidCyan)
                         .lineLimit(1)
                 }
-                .opacity(isOverlayOn || showTofControls ? 1.0 : 0.55)
+                .opacity(isOverlayOn || activePanel == .tof ? 1.0 : 0.55)
                 .padding(.leading, 12)
                 .padding(.trailing, 8)
                 .frame(minWidth: QuackTheme.minTouchTarget, minHeight: QuackTheme.minTouchTarget)
@@ -289,7 +463,7 @@ struct LandscapeHudOverlay: View {
     private var sensorsToggleButton: some View {
         Button {
             QuackHaptics.light()
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+            withAnimation(reduceMotion ? .none : .spring(response: 0.28, dampingFraction: 0.85)) {
                 isSensorsDrawerOpen.toggle()
             }
         } label: {

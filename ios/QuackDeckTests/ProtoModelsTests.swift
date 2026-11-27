@@ -304,4 +304,219 @@ final class ProtoModelsTests: XCTestCase {
         XCTAssertNil(minimal.sitstand)
         XCTAssertNil(minimal.unavailable)
     }
+
+    func testSubscribeResultDecodeWithEmotionsAndDiscovery() throws {
+        let json = """
+        {
+          "accepted": true,
+          "walk": "velstand.onnx",
+          "stand": null,
+          "sitstand": "alpha_sitstand.onnx",
+          "ground_pick": null,
+          "skills": ["sit_toggle", "angry", "curious", "devastated", "yes_fast"],
+          "unavailable": null
+        }
+        """
+        let subscribe = try decoder.decode(SubscribeResult.self, from: Data(json.utf8))
+        XCTAssertEqual(subscribe.skills, ["sit_toggle", "angry", "curious", "devastated", "yes_fast"])
+
+        let reencoded = try encoder.encode(subscribe)
+        XCTAssertEqual(try decoder.decode(SubscribeResult.self, from: reencoded), subscribe)
+
+        let policies = PoliciesResult(
+            mode: "walk",
+            enabled: true,
+            slots: [
+                PolicySlot(slot: "walk", path: "velstand.onnx", origin: "official"),
+                PolicySlot(slot: "sitstand", path: "alpha_sitstand.onnx", origin: "official")
+            ],
+            skills: ["sit_toggle"],
+            homed: true,
+            sitting: false
+        )
+        XCTAssertEqual(
+            MicroduckEmotions.discover(subscribeAck: subscribe, policies: policies),
+            ["angry", "curious", "devastated", "yes_fast"]
+        )
+    }
+
+    func testMicroduckEmotionsHelpersAndDiscoveryEdgeCases() {
+        XCTAssertEqual(MicroduckEmotions.defaultShippedNames.count, 13)
+        XCTAssertEqual(
+            MicroduckEmotions.defaultShippedNames,
+            [
+                "angry",
+                "curious",
+                "defiant",
+                "devastated",
+                "excited",
+                "impatient",
+                "laugh",
+                "mmh",
+                "mock",
+                "no",
+                "sad",
+                "yes",
+                "yes_fast"
+            ]
+        )
+
+        // Display labels
+        XCTAssertEqual(MicroduckEmotions.displayLabel(for: "yes_fast"), "Yes Fast")
+        XCTAssertEqual(MicroduckEmotions.displayLabel(for: "mmh"), "Mmh")
+        XCTAssertEqual(MicroduckEmotions.displayLabel(for: "curious"), "Curious")
+        XCTAssertEqual(MicroduckEmotions.displayLabel(for: "super-happy_duck"), "Super Happy Duck")
+
+        // Sitting predicate
+        XCTAssertTrue(MicroduckEmotions.maySitRobot("devastated"))
+        XCTAssertFalse(MicroduckEmotions.maySitRobot("curious"))
+        XCTAssertFalse(MicroduckEmotions.maySitRobot("sad"))
+        XCTAssertFalse(MicroduckEmotions.maySitRobot("sit_toggle"))
+
+        // Shipped durations
+        let expectedDurations: [String: TimeInterval] = [
+            "angry": 2.5,
+            "curious": 2.9,
+            "defiant": 2.1,
+            "devastated": 8.5,
+            "excited": 3.3,
+            "impatient": 2.5,
+            "laugh": 2.9,
+            "mmh": 1.9,
+            "mock": 2.5,
+            "no": 1.7,
+            "sad": 7.5,
+            "yes": 1.4,
+            "yes_fast": 1.4
+        ]
+        for (name, expected) in expectedDurations {
+            XCTAssertEqual(MicroduckEmotions.knownDurationSeconds(for: name), expected, "Duration mismatch for \(name)")
+        }
+        XCTAssertNil(MicroduckEmotions.knownDurationSeconds(for: "custom_dance"))
+
+        // Nil ack gating
+        let samplePolicies = PoliciesResult(skills: ["sit_toggle"])
+        let sampleSubscribe = SubscribeResult(skills: ["sit_toggle", "curious"])
+        XCTAssertEqual(MicroduckEmotions.discover(subscribeAck: nil, policies: nil), [])
+        XCTAssertEqual(MicroduckEmotions.discover(subscribeAck: nil, policies: samplePolicies), [])
+        XCTAssertEqual(MicroduckEmotions.discover(subscribeAck: sampleSubscribe, policies: nil), [])
+
+        // Older daemons without emotion names in SubscribeResult.skills yield []
+        let legacySubscribe = SubscribeResult(skills: ["sit_toggle", "ground_pick"])
+        XCTAssertEqual(MicroduckEmotions.discover(subscribeAck: legacySubscribe, policies: samplePolicies), [])
+
+        // Default 13 discovery after policy skills
+        let defaultSubscribe = SubscribeResult(
+            skills: ["sit_toggle", "ground_pick"] + MicroduckEmotions.defaultShippedNames
+        )
+        let fullPolicies = PoliciesResult(skills: ["sit_toggle", "ground_pick"])
+        XCTAssertEqual(
+            MicroduckEmotions.discover(subscribeAck: defaultSubscribe, policies: fullPolicies),
+            MicroduckEmotions.defaultShippedNames
+        )
+
+        // Custom emotions, order preservation, deduplication, whitespace trimming, and policy-wins exclusion
+        let customSubscribe = SubscribeResult(
+            skills: [
+                "  ",
+                "sit_toggle",
+                "happy_flap",
+                "custom_policy",
+                "ground_pick",
+                "curious",
+                "happy_flap",
+                "  proud_spin  "
+            ]
+        )
+        let customPolicies = PoliciesResult(skills: ["sit_toggle", "custom_policy"])
+        XCTAssertEqual(
+            MicroduckEmotions.discover(subscribeAck: customSubscribe, policies: customPolicies),
+            ["happy_flap", "curious", "proud_spin"]
+        )
+
+        // Built-in kick skills are never treated as emotions
+        let withKickSubscribe = SubscribeResult(skills: ["kick_left", "kick_right", "curious"])
+        let noKickPolicies = PoliciesResult(skills: ["sit_toggle"])
+        XCTAssertEqual(
+            MicroduckEmotions.discover(subscribeAck: withKickSubscribe, policies: noKickPolicies),
+            ["curious"]
+        )
+    }
+
+    func testMicroduckKicksDiscoveryVariants() {
+        let subAck = SubscribeResult(skills: ["kick_left", "kick_right", "curious"])
+        // Never trust subscribeAck before PoliciesResult arrives
+        XCTAssertEqual(MicroduckKicks.discover(policies: nil, subscribeAck: subAck), [])
+
+        // Both kick slots loaded + present in skills
+        let bothLoaded = PoliciesResult(
+            slots: [
+                PolicySlot(slot: "kick_left", path: "ball_kick_left.onnx", origin: "official"),
+                PolicySlot(slot: "kick_right", path: "ball_kick_right.onnx", origin: "official")
+            ],
+            skills: ["kick_left", "kick_right"]
+        )
+        XCTAssertEqual(MicroduckKicks.discover(policies: bothLoaded, subscribeAck: subAck), [.left, .right])
+
+        // Single loaded foot; explicit nil slot never advertises even if in skills
+        let onlyLeft = PoliciesResult(
+            slots: [
+                PolicySlot(slot: "kick_left", path: "ball_kick_left.onnx", origin: "official"),
+                PolicySlot(slot: "kick_right", path: nil, origin: nil)
+            ],
+            skills: ["kick_left", "kick_right"]
+        )
+        XCTAssertEqual(MicroduckKicks.discover(policies: onlyLeft, subscribeAck: subAck), [.left])
+
+        // Legacy schema without kick slots falls back to PoliciesResult.skills
+        let legacyRight = PoliciesResult(
+            slots: [PolicySlot(slot: "walk", path: "velstand.onnx", origin: "official")],
+            skills: ["kick_right"]
+        )
+        XCTAssertEqual(MicroduckKicks.discover(policies: legacyRight, subscribeAck: subAck), [.right])
+
+        // Layout projection only flattens brief kick skills
+        XCTAssertEqual(
+            CockpitState.runningSkill(name: "kick_left").layoutProjected(hasSitstand: true),
+            .walking(hasSitstand: true)
+        )
+        XCTAssertEqual(
+            CockpitState.runningSkill(name: "ground_pick").layoutProjected(hasSitstand: true),
+            .runningSkill(name: "ground_pick")
+        )
+    }
+
+    func testVideoStageGeometryFillFitAndRotation() {
+        let stage = CGSize(width: 375, height: 300)
+        let media = MediaVideoInfo(width: 1280, height: 720, rotate: 0)
+
+        let fit = VideoStageGeometry.compute(stageSize: stage, mediaVideo: media, framing: .fit)
+        XCTAssertEqual(fit.imageRect.width, 375, accuracy: 0.01)
+        XCTAssertEqual(fit.imageRect.height, 210.94, accuracy: 0.05)
+        XCTAssertEqual(fit.imageRect.minY, 44.53, accuracy: 0.05)
+        XCTAssertEqual(fit.visibleRect, fit.imageRect)
+        // Touch inside top letterbox bar sends no gaze
+        XCTAssertNil(fit.normalizedAim(forStagePoint: CGPoint(x: 180, y: 12)))
+        // Center of visible video maps to (0, 0)
+        let centerAim = fit.normalizedAim(forStagePoint: CGPoint(x: 187.5, y: 150))
+        XCTAssertNotNil(centerAim)
+        XCTAssertEqual(centerAim?.x ?? 99, 0, accuracy: 0.01)
+        XCTAssertEqual(centerAim?.y ?? 99, 0, accuracy: 0.01)
+
+        let fill = VideoStageGeometry.compute(stageSize: stage, mediaVideo: media, framing: .fill)
+        XCTAssertEqual(fill.imageRect.width, 533.33, accuracy: 0.1)
+        XCTAssertEqual(fill.imageRect.height, 300, accuracy: 0.01)
+        XCTAssertEqual(fill.imageRect.minX, -79.17, accuracy: 0.1)
+        XCTAssertEqual(fill.visibleRect, CGRect(x: 0, y: 0, width: 375, height: 300))
+        // Aim on cropped left edge is hidden in Fill mode
+        XCTAssertNil(fill.stagePoint(forNormalizedAim: CGPoint(x: -0.95, y: 0)))
+
+        // 90° rotated stream swaps source aspect -> side letterbox bars in Full frame
+        let rotatedMedia = MediaVideoInfo(width: 1280, height: 720, rotate: 90)
+        let fit90 = VideoStageGeometry.compute(stageSize: stage, mediaVideo: rotatedMedia, framing: .fit)
+        XCTAssertEqual(fit90.uprightSourceSize, CGSize(width: 720, height: 1280))
+        XCTAssertEqual(fit90.imageRect.height, 300, accuracy: 0.01)
+        XCTAssertLessThan(fit90.imageRect.width, 375)
+        XCTAssertGreaterThan(fit90.imageRect.minX, 0)
+    }
 }

@@ -32,7 +32,7 @@ struct PostureBarView: View {
     }
 
     var body: some View {
-        let state = appState.cockpitState
+        let state = appState.layoutCockpitState
 
         Group {
             switch style {
@@ -71,14 +71,16 @@ struct PostureBarView: View {
         ) { kind in
             if case .withSafeRest(let isSeated) = kind {
                 Button(isSeated ? "Rest & Relax (~5 s)" : "Sit & Relax (~5 s)") {
+                    let bound = appState.pendingBoundConfirmation
                     Task {
-                        await appState.confirmRestAndRelax()
+                        await appState.confirmRestAndRelax(bound: bound)
                     }
                 }
             }
             Button("Relax Now (Hold Robot)", role: .destructive) {
+                let bound = appState.pendingBoundConfirmation
                 Task {
-                    await appState.confirmRelaxNow()
+                    await appState.confirmRelaxNow(bound: bound)
                 }
             }
             Button("Shut Down Robot", role: .destructive) {
@@ -653,8 +655,9 @@ struct PostureBarView: View {
     private func alertActions(for confirmation: CockpitConfirmation) -> some View {
         if let spec = alertConfirmSpec(for: confirmation) {
             Button(spec.title, role: spec.role) {
+                let bound = appState.pendingBoundConfirmation
                 Task {
-                    await appState.confirm(confirmation)
+                    await appState.confirmDialogAction(bound: bound)
                 }
             }
             Button("Cancel", role: .cancel) {

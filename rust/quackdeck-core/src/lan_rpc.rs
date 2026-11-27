@@ -12,6 +12,7 @@ use crate::setup_code::decode_psk_hex;
 struct RpcIo {
     reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
     writer: WriteHalf<tokio::io::DuplexStream>,
+    poisoned: bool,
 }
 
 /// Authenticated Noise TCP client for `duck-gateway` port `9444` (NDJSON JSON-RPC lane).
@@ -53,6 +54,7 @@ impl LanRpcClient {
             io: Mutex::new(RpcIo {
                 reader: BufReader::new(read_half),
                 writer: write_half,
+                poisoned: false,
             }),
             proxy_task,
         })
@@ -67,7 +69,11 @@ impl LanRpcClient {
             .await
             .map_err(|_| "Timed out waiting for LAN RPC lock".to_owned())?;
 
-        timeout_at(deadline, async {
+        if io.poisoned {
+            return Err("LAN RPC connection retired after previous error".to_owned());
+        }
+
+        let write_res = timeout_at(deadline, async {
             io.writer
                 .write_all(&payload)
                 .await
@@ -78,15 +84,40 @@ impl LanRpcClient {
                 .map_err(|e| format!("LAN RPC flush failed: {e}"))?;
             Ok::<(), String>(())
         })
-        .await
-        .map_err(|_| "Timed out writing LAN RPC request".to_owned())??;
+        .await;
+
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                io.poisoned = true;
+                self.proxy_task.abort();
+                return Err(err);
+            }
+            Err(_) => {
+                io.poisoned = true;
+                self.proxy_task.abort();
+                return Err("Timed out writing LAN RPC request".to_owned());
+            }
+        }
 
         let mut line = String::new();
-        let bytes = timeout_at(deadline, io.reader.read_line(&mut line))
-            .await
-            .map_err(|_| "Timed out waiting for LAN RPC reply".to_owned())?
-            .map_err(|e| format!("LAN RPC read failed: {e}"))?;
+        let read_res = timeout_at(deadline, io.reader.read_line(&mut line)).await;
+        let bytes = match read_res {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(err)) => {
+                io.poisoned = true;
+                self.proxy_task.abort();
+                return Err(format!("LAN RPC read failed: {err}"));
+            }
+            Err(_) => {
+                io.poisoned = true;
+                self.proxy_task.abort();
+                return Err("Timed out waiting for LAN RPC reply".to_owned());
+            }
+        };
         if bytes == 0 {
+            io.poisoned = true;
+            self.proxy_task.abort();
             return Err("LAN RPC connection closed by robot".to_owned());
         }
         Ok(line.trim_end_matches(['\r', '\n']).to_owned())
@@ -178,5 +209,55 @@ mod tests {
 
         drop(client);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lan_rpc_retires_connection_after_read_timeout_preventing_late_reply_desync() {
+        let psk = [0x35u8; 32];
+        let psk_hex = "35".repeat(32);
+        let robot_id = "duck-01";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let session = robot_handshake(&mut socket, &psk, robot_id).await.unwrap();
+            let (local, proxy_half) = tokio::io::duplex(16 * 1024);
+            let _proxy = tokio::spawn(async move {
+                let _ = proxy(proxy_half, socket, session).await;
+            });
+            let (r, mut w) = tokio::io::split(local);
+            let mut br = BufReader::new(r);
+            let mut line = String::new();
+            br.read_line(&mut line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Delayed reply for request 1 arrives after request 1 already timed out.
+            let _ = w
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"late\":true}}\n")
+                .await;
+            let _ = w.flush().await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+
+        let client = LanRpcClient::connect("127.0.0.1", port, robot_id, &psk_hex, 2000)
+            .await
+            .unwrap();
+
+        let first = client
+            .call(r#"{"jsonrpc":"2.0","id":1,"method":"system.info","params":{}}"#, 50)
+            .await;
+        assert!(first.is_err());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second = client
+            .call(r#"{"jsonrpc":"2.0","id":2,"method":"robot.health","params":{}}"#, 500)
+            .await;
+        let err = second.expect_err("retired connection must refuse call 2 instead of reading call 1's late reply");
+        assert!(err.contains("retired"), "unexpected error: {err}");
+
+        drop(client);
+        let _ = server.await;
     }
 }

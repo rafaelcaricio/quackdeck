@@ -86,4 +86,52 @@ final class CoreBridgeTests: XCTestCase {
         // Invalid PSK length fails in begin.
         XCTAssertThrowsError(try BleNoiseSession.begin(pskHex: "deadbeef", robotId: "duck-01", mtu: 20))
     }
+
+    func testRobotVaultPreservesCorruptBackupAndRecoversValidEntries() throws {
+        let suiteName = "quackdeck.vaultTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let defaultsKey = "pairedDucks.\(UUID().uuidString)"
+        let vault = RobotVault(
+            keychainService: "com.caricio.quackdeck.vaultTests.\(UUID().uuidString)",
+            defaultsKey: defaultsKey,
+            defaults: defaults
+        )
+
+        // Case 1: Mixed JSON array where one entry is valid and one is malformed -> lossy recovery + backup
+        let mixedPayload = """
+        [
+          {"robotId":"duck-good","name":"Good Duck","pairedAt":1000},
+          {"robotId":123,"broken":true}
+        ]
+        """.data(using: .utf8)!
+        defaults.set(mixedPayload, forKey: defaultsKey)
+
+        let recovered = vault.loadPairedDucks()
+        XCTAssertTrue(vault.hasCorruptIndexBackup)
+        XCTAssertEqual(recovered.map(\.robotId), ["duck-good"])
+
+        // Case 2: Completely unparseable index blocks silent overwrite
+        let corruptSuite = "quackdeck.corruptTests.\(UUID().uuidString)"
+        let corruptDefaults = UserDefaults(suiteName: corruptSuite)!
+        defer { corruptDefaults.removePersistentDomain(forName: corruptSuite) }
+        let corruptKey = "pairedDucks.\(UUID().uuidString)"
+        let corruptVault = RobotVault(
+            keychainService: "com.caricio.quackdeck.corruptTests.\(UUID().uuidString)",
+            defaultsKey: corruptKey,
+            defaults: corruptDefaults
+        )
+        let rawGarbage = Data("not-json-at-all".utf8)
+        corruptDefaults.set(rawGarbage, forKey: corruptKey)
+        XCTAssertEqual(corruptVault.loadPairedDucks(), [])
+        XCTAssertTrue(corruptVault.hasCorruptIndexBackup)
+        XCTAssertEqual(corruptDefaults.data(forKey: "\(corruptKey).corruptBackup"), rawGarbage)
+        XCTAssertThrowsError(
+            try corruptVault.save(
+                duck: PairedDuck(robotId: "duck-new", name: "New"),
+                pskHex: String(repeating: "ab", count: 32)
+            )
+        )
+    }
 }

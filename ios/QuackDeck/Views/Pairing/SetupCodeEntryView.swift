@@ -346,18 +346,28 @@ private struct QrScannerView: UIViewRepresentable {
         private let session = AVCaptureSession()
         private let sessionQueue = DispatchQueue(label: "com.caricio.quackdeck.qr")
         private var configured = false
+        private let generationLock = NSLock()
+        private var activeGeneration: UInt64 = 0
 
         init(onScannedCode: @escaping (String) -> Void, onUnavailable: @escaping (String) -> Void) {
             self.onScannedCode = onScannedCode
             self.onUnavailable = onUnavailable
         }
 
+        private func currentGeneration() -> UInt64 {
+            generationLock.lock()
+            defer { generationLock.unlock() }
+            return activeGeneration
+        }
+
         func configure(in view: ScannerContainerView) {
             guard !configured else { return }
             configured = true
+            let gen = currentGeneration()
 
             guard let device = AVCaptureDevice.default(for: .video) else {
                 DispatchQueue.main.async {
+                    guard self.currentGeneration() == gen else { return }
                     self.onUnavailable("Camera unavailable here. Paste the md1: code below.")
                 }
                 return
@@ -365,30 +375,36 @@ private struct QrScannerView: UIViewRepresentable {
 
             switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized:
-                startCapture(device: device, in: view)
+                startCapture(device: device, in: view, generation: gen)
             case .notDetermined:
                 AVCaptureDevice.requestAccess(for: .video) { granted in
+                    guard self.currentGeneration() == gen else { return }
                     if granted {
-                        self.startCapture(device: device, in: view)
+                        self.startCapture(device: device, in: view, generation: gen)
                     } else {
                         DispatchQueue.main.async {
+                            guard self.currentGeneration() == gen else { return }
                             self.onUnavailable("Camera permission denied. Paste the md1: code below.")
                         }
                     }
                 }
             default:
                 DispatchQueue.main.async {
+                    guard self.currentGeneration() == gen else { return }
                     self.onUnavailable("Camera access blocked. Allow it in Settings or paste the code below.")
                 }
             }
         }
 
-        private func startCapture(device: AVCaptureDevice, in view: ScannerContainerView) {
+        private func startCapture(device: AVCaptureDevice, in view: ScannerContainerView, generation: UInt64) {
             sessionQueue.async {
+                guard self.currentGeneration() == generation else { return }
                 do {
                     let input = try AVCaptureDeviceInput(device: device)
+                    guard self.currentGeneration() == generation else { return }
                     guard self.session.canAddInput(input) else {
                         DispatchQueue.main.async {
+                            guard self.currentGeneration() == generation else { return }
                             self.onUnavailable("Could not start camera input.")
                         }
                         return
@@ -398,6 +414,7 @@ private struct QrScannerView: UIViewRepresentable {
                     let output = AVCaptureMetadataOutput()
                     guard self.session.canAddOutput(output) else {
                         DispatchQueue.main.async {
+                            guard self.currentGeneration() == generation else { return }
                             self.onUnavailable("QR reader unavailable on this device.")
                         }
                         return
@@ -408,14 +425,17 @@ private struct QrScannerView: UIViewRepresentable {
 
                     let preview = AVCaptureVideoPreviewLayer(session: self.session)
                     preview.videoGravity = .resizeAspectFill
-                    DispatchQueue.main.async {
+                    DispatchQueue.main.async { [weak view] in
+                        guard self.currentGeneration() == generation, let view else { return }
                         view.previewLayer = preview
                         preview.frame = view.bounds
                         view.layer.insertSublayer(preview, at: 0)
                     }
+                    guard self.currentGeneration() == generation else { return }
                     self.session.startRunning()
                 } catch {
                     DispatchQueue.main.async {
+                        guard self.currentGeneration() == generation else { return }
                         self.onUnavailable("Camera error: \(error.localizedDescription)")
                     }
                 }
@@ -423,6 +443,10 @@ private struct QrScannerView: UIViewRepresentable {
         }
 
         func stop() {
+            generationLock.lock()
+            activeGeneration &+= 1
+            generationLock.unlock()
+
             sessionQueue.async {
                 if self.session.isRunning {
                     self.session.stopRunning()

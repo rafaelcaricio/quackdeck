@@ -154,6 +154,7 @@ final class WebRTCSession: NSObject {
 
     private static let reconnectBackoffSeconds: [Int] = [1, 2, 3, 5, 8, 10]
     private static let connectWatchdogSeconds: TimeInterval = 12.0
+    private static let firstFrameWatchdogSeconds: TimeInterval = 12.0
 
     private static let sharedFactory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -168,15 +169,19 @@ final class WebRTCSession: NSObject {
     var onControlChannelClosed: (() -> Void)?
     var onNotification: ((_ method: String, _ params: [String: Any]) -> Void)?
     var onVideoStats: ((_ fps: Double) -> Void)?
+    var onFirstFrameTimeoutChanged: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
     var onReconnecting: ((_ attempt: Int, _ delaySeconds: Int, _ reason: String) -> Void)?
 
     private var endpoint: EndpointConfig?
     private var signallingClient: SignallingClient?
     private var signallingTask: Task<Void, Never>?
+    private var signallingSendQueue: [String] = []
+    private var signallingSendTask: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var connectWatchdogTask: Task<Void, Never>?
+    private var firstFrameWatchdogTask: Task<Void, Never>?
     private var iceDisconnectGraceTask: Task<Void, Never>?
     private var stabilityResetTask: Task<Void, Never>?
 
@@ -191,6 +196,7 @@ final class WebRTCSession: NSObject {
     private var isTearingDown = false
     private var sessionGeneration: UInt64 = 0
     private var didNotifyControlOpenForGeneration = false
+    private var isFirstFrameTimedOut = false
 
     private var nextRpcId: Int = 1
     private var pendingRpc: [Int: (Result<Data, Error>) -> Void] = [:]
@@ -233,6 +239,8 @@ final class WebRTCSession: NSObject {
         reconnectTask = nil
         connectWatchdogTask?.cancel()
         connectWatchdogTask = nil
+        firstFrameWatchdogTask?.cancel()
+        firstFrameWatchdogTask = nil
         iceDisconnectGraceTask?.cancel()
         iceDisconnectGraceTask = nil
     }
@@ -427,6 +435,13 @@ final class WebRTCSession: NSObject {
         connectWatchdogTask?.cancel()
         connectWatchdogTask = nil
 
+        firstFrameWatchdogTask?.cancel()
+        firstFrameWatchdogTask = nil
+        if isFirstFrameTimedOut {
+            isFirstFrameTimedOut = false
+            onFirstFrameTimeoutChanged?(false)
+        }
+
         iceDisconnectGraceTask?.cancel()
         iceDisconnectGraceTask = nil
 
@@ -435,6 +450,10 @@ final class WebRTCSession: NSObject {
 
         statsTask?.cancel()
         statsTask = nil
+
+        signallingSendTask?.cancel()
+        signallingSendTask = nil
+        signallingSendQueue.removeAll()
 
         signallingTask?.cancel()
         signallingTask = nil
@@ -467,13 +486,48 @@ final class WebRTCSession: NSObject {
     }
 
     private func sendSignalling(_ dict: [String: Any]) {
-        guard let client = signallingClient,
+        guard signallingClient != nil,
               let data = try? JSONSerialization.data(withJSONObject: dict, options: []),
               let text = String(data: data, encoding: .utf8) else {
             return
         }
-        Task.detached(priority: .userInitiated) {
-            try? client.send(text: text)
+        signallingSendQueue.append(text)
+        drainSignallingQueue()
+    }
+
+    private func drainSignallingQueue() {
+        guard signallingSendTask == nil else { return }
+        let generation = sessionGeneration
+        signallingSendTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.signallingSendTask = nil }
+
+            while !Task.isCancelled,
+                  generation == self.sessionGeneration,
+                  !self.isTearingDown,
+                  !self.signallingSendQueue.isEmpty,
+                  let client = self.signallingClient {
+                let nextText = self.signallingSendQueue.removeFirst()
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try client.send(text: nextText)
+                    }.value
+                } catch {
+                    guard !Task.isCancelled,
+                          generation == self.sessionGeneration,
+                          !self.isTearingDown else {
+                        return
+                    }
+                    if self.expectingPeerShutdown {
+                        self.finishExpectedPeerShutdown()
+                        return
+                    }
+                    let reason = error.localizedDescription
+                    self.onError?(reason)
+                    self.scheduleReconnect(reason: reason)
+                    return
+                }
+            }
         }
     }
 
@@ -667,6 +721,12 @@ final class WebRTCSession: NSObject {
             lastFrameProgressAt = now
             if framesDecoded > 0 {
                 freezeArmed = true
+                firstFrameWatchdogTask?.cancel()
+                firstFrameWatchdogTask = nil
+                if isFirstFrameTimedOut {
+                    isFirstFrameTimedOut = false
+                    onFirstFrameTimeoutChanged?(false)
+                }
                 if isControlOpen {
                     reconnectAttempts = 0
                 }
@@ -724,6 +784,10 @@ final class WebRTCSession: NSObject {
         connectWatchdogTask?.cancel()
         connectWatchdogTask = nil
 
+        if lastDecodedFrames == 0 && !expectingPeerShutdown {
+            startFirstFrameWatchdog(generation: generation)
+        }
+
         stabilityResetTask?.cancel()
         stabilityResetTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -737,6 +801,26 @@ final class WebRTCSession: NSObject {
         }
 
         onControlChannelOpen?()
+    }
+
+    private func startFirstFrameWatchdog(generation: UInt64) {
+        firstFrameWatchdogTask?.cancel()
+        firstFrameWatchdogTask = Task { [weak self] in
+            let ns = UInt64(Self.firstFrameWatchdogSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            guard let self,
+                  !Task.isCancelled,
+                  !self.isTearingDown,
+                  self.sessionGeneration == generation,
+                  self.isControlOpen,
+                  self.lastDecodedFrames == 0,
+                  !self.expectingPeerShutdown else {
+                return
+            }
+            self.isFirstFrameTimedOut = true
+            self.onFirstFrameTimeoutChanged?(true)
+            self.onError?("Camera stream did not start (control still active).")
+        }
     }
 
     // MARK: - Async wrappers for RTCPeerConnection callbacks

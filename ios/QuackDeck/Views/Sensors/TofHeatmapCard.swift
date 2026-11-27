@@ -104,7 +104,7 @@ struct TofHeatmapCard: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: isCompact ? 6 : 8) {
             HStack(spacing: 8) {
-                Text("VIDEO OVERLAY")
+                Text("DEPTH OVERLAY")
                     .font(QuackTheme.condensedDisplay(size: 11))
                     .foregroundStyle(QuackTheme.creamText.opacity(0.65))
                     .tracking(0.5)
@@ -119,11 +119,14 @@ struct TofHeatmapCard: View {
                             : QuackTheme.creamText.opacity(0.45)
                     )
 
-                Toggle("", isOn: isEnabled)
+                Toggle("Depth overlay", isOn: isEnabled)
                     .labelsHidden()
                     .tint(QuackTheme.acidCyan)
                     .scaleEffect(isCompact ? 0.85 : 0.92)
+                    .accessibilityLabel("Depth overlay")
+                    .accessibilityValue(isEnabled.wrappedValue ? "On, \(Int((opacity.wrappedValue * 100).rounded())) percent" : "Off")
             }
+            .frame(minHeight: QuackTheme.minTouchTarget)
 
             Slider(
                 value: Binding(

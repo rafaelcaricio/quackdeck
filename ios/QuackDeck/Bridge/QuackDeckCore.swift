@@ -203,6 +203,12 @@ final class BleNoiseSession: @unchecked Sendable {
         mtu: Int
     ) throws -> (session: BleNoiseSession, initialChunks: [Data]) {
         var rawHandle: OpaquePointer?
+        var adopted = false
+        defer {
+            if !adopted, let leaked = rawHandle {
+                qd_ble_session_free(leaked)
+            }
+        }
         let payload: BleChunksPayload = try pskHex.withCString { pskPtr in
             try robotId.withCString { idPtr in
                 try decodeCoreResult(qd_ble_session_new(pskPtr, idPtr, mtu, &rawHandle))
@@ -212,7 +218,9 @@ final class BleNoiseSession: @unchecked Sendable {
             throw QuackCoreError.nullHandle
         }
         let chunks = try decodeBase64Chunks(payload.outboundChunksB64)
-        return (BleNoiseSession(handle: rawHandle), chunks)
+        let session = BleNoiseSession(handle: rawHandle)
+        adopted = true
+        return (session, chunks)
     }
 
     func feed(_ chunk: Data, mtu: Int) throws -> BleStepOutput {
@@ -257,6 +265,12 @@ final class LanRpcClient: @unchecked Sendable {
         timeoutMs: UInt64 = 4000
     ) throws {
         var rawHandle: OpaquePointer?
+        var adopted = false
+        defer {
+            if !adopted, let leaked = rawHandle {
+                qd_lan_rpc_free(leaked)
+            }
+        }
         let _: Bool = try host.withCString { hostPtr in
             try robotId.withCString { idPtr in
                 try pskHex.withCString { pskPtr in
@@ -270,6 +284,7 @@ final class LanRpcClient: @unchecked Sendable {
             throw QuackCoreError.nullHandle
         }
         self.handle = rawHandle
+        adopted = true
     }
 
     deinit {
@@ -307,6 +322,12 @@ final class SignallingClient: @unchecked Sendable {
         timeoutMs: UInt64 = 4000
     ) throws {
         var rawHandle: OpaquePointer?
+        var adopted = false
+        defer {
+            if !adopted, let leaked = rawHandle {
+                qd_sig_free(leaked)
+            }
+        }
         let _: Bool = try host.withCString { hostPtr in
             try robotId.withCString { idPtr in
                 try pskHex.withCString { pskPtr in
@@ -320,6 +341,7 @@ final class SignallingClient: @unchecked Sendable {
             throw QuackCoreError.nullHandle
         }
         self.handle = rawHandle
+        adopted = true
     }
 
     deinit {

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 enum MicroduckJoints {
@@ -24,6 +25,269 @@ enum MicroduckJoints {
         30, 31, 32, 33, 34,
         10, 11, 12, 13, 14
     ]
+}
+
+enum MicroduckEmotions {
+    static let defaultShippedNames: [String] = [
+        "angry",
+        "curious",
+        "defiant",
+        "devastated",
+        "excited",
+        "impatient",
+        "laugh",
+        "mmh",
+        "mock",
+        "no",
+        "sad",
+        "yes",
+        "yes_fast"
+    ]
+
+    static let knownSittingNames: Set<String> = ["devastated"]
+
+    private static let reservedBuiltinSkills: Set<String> = ["sit_toggle", "ground_pick", "kick_left", "kick_right"]
+
+    private static let knownDurations: [String: TimeInterval] = [
+        "angry": 2.5,
+        "curious": 2.9,
+        "defiant": 2.1,
+        "devastated": 8.5,
+        "excited": 3.3,
+        "impatient": 2.5,
+        "laugh": 2.9,
+        "mmh": 1.9,
+        "mock": 2.5,
+        "no": 1.7,
+        "sad": 7.5,
+        "yes": 1.4,
+        "yes_fast": 1.4
+    ]
+
+    static func discover(subscribeAck: SubscribeResult?, policies: PoliciesResult?) -> [String] {
+        guard let subscribeAck, let policies else { return [] }
+        let excluded = Set(policies.skills).union(reservedBuiltinSkills)
+        var seen = Set<String>()
+        var discovered: [String] = []
+        for raw in subscribeAck.skills {
+            let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !excluded.contains(name), seen.insert(name).inserted else {
+                continue
+            }
+            discovered.append(name)
+        }
+        return discovered
+    }
+
+    static func displayLabel(for name: String) -> String {
+        let normalized = name
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        return normalized
+            .split(whereSeparator: \.isWhitespace)
+            .map { word in
+                guard let first = word.first else { return "" }
+                return String(first).uppercased() + word.dropFirst()
+            }
+            .joined(separator: " ")
+    }
+
+    static func knownDurationSeconds(for name: String) -> TimeInterval? {
+        knownDurations[name]
+    }
+
+    static func maySitRobot(_ name: String) -> Bool {
+        knownSittingNames.contains(name)
+    }
+}
+
+// MARK: - Microduck kicks
+
+enum KickSide: String, CaseIterable, Codable, Sendable, Equatable, Hashable {
+    case left = "kick_left"
+    case right = "kick_right"
+
+    var skillName: String { rawValue }
+
+    var shortLabel: String {
+        switch self {
+        case .left: return "Kick L"
+        case .right: return "Kick R"
+        }
+    }
+
+    var fullLabel: String {
+        switch self {
+        case .left: return "Kick Left"
+        case .right: return "Kick Right"
+        }
+    }
+
+    var badgeText: String {
+        switch self {
+        case .left: return "L"
+        case .right: return "R"
+        }
+    }
+
+    var activeBannerText: String {
+        switch self {
+        case .left: return "Kicking Left"
+        case .right: return "Kicking Right"
+        }
+    }
+}
+
+enum MicroduckKicks {
+    static let durationSeconds: TimeInterval = 0.5
+
+    /// Discovers available kick feet from `PoliciesResult`:
+    /// - If `policies.slots` lists kick slots explicitly, include a side only when `slot.path != nil`
+    ///   and `policies.skills` advertises the skill (never show a foot whose slot is explicitly nil).
+    /// - Otherwise fall back to `policies.skills` for schemas without kick slot entries.
+    static func discover(policies: PoliciesResult?, subscribeAck _: SubscribeResult?) -> Set<KickSide> {
+        guard let policies else { return [] }
+        let skillSet = Set(policies.skills)
+        var slotEntries: [KickSide: PolicySlot] = [:]
+        for slot in policies.slots {
+            if let side = KickSide(rawValue: slot.slot) {
+                slotEntries[side] = slot
+            }
+        }
+        if !slotEntries.isEmpty {
+            var sides: Set<KickSide> = []
+            for (side, slot) in slotEntries where slot.path != nil && skillSet.contains(side.skillName) {
+                sides.insert(side)
+            }
+            return sides
+        }
+        var sides: Set<KickSide> = []
+        for skill in policies.skills {
+            if let side = KickSide(rawValue: skill) {
+                sides.insert(side)
+            }
+        }
+        return sides
+    }
+}
+
+enum PortraitVideoFraming: String, CaseIterable, Codable, Sendable, Equatable {
+    case fill
+    case fit
+
+    var title: String {
+        switch self {
+        case .fill: return "Fill screen"
+        case .fit: return "Full frame"
+        }
+    }
+
+    var toggled: PortraitVideoFraming {
+        self == .fill ? .fit : .fill
+    }
+}
+
+struct VideoStageGeometry: Equatable, Sendable {
+    let stageSize: CGSize
+    let uprightSourceSize: CGSize
+    let imageRect: CGRect
+    let visibleRect: CGRect
+
+    static func compute(
+        stageSize: CGSize,
+        mediaVideo: MediaVideoInfo?,
+        framing: PortraitVideoFraming
+    ) -> VideoStageGeometry {
+        let stageW = max(1, stageSize.width)
+        let stageH = max(1, stageSize.height)
+
+        let rawW: CGFloat
+        let rawH: CGFloat
+        if let mediaVideo, mediaVideo.width > 0, mediaVideo.height > 0 {
+            rawW = CGFloat(mediaVideo.width)
+            rawH = CGFloat(mediaVideo.height)
+        } else {
+            rawW = 1280
+            rawH = 720
+        }
+
+        let rot = ((mediaVideo?.rotate ?? 0) % 360 + 360) % 360
+        let isQuarterTurn = rot == 90 || rot == 270
+        let srcW = isQuarterTurn ? rawH : rawW
+        let srcH = isQuarterTurn ? rawW : rawH
+
+        let scale: CGFloat
+        switch framing {
+        case .fit:
+            scale = min(stageW / srcW, stageH / srcH)
+        case .fill:
+            scale = max(stageW / srcW, stageH / srcH)
+        }
+
+        let imageW = srcW * scale
+        let imageH = srcH * scale
+        let imageRect = CGRect(
+            x: (stageW - imageW) * 0.5,
+            y: (stageH - imageH) * 0.5,
+            width: imageW,
+            height: imageH
+        )
+        let stageBounds = CGRect(origin: .zero, size: CGSize(width: stageW, height: stageH))
+        let visibleRect = imageRect.intersection(stageBounds)
+
+        return VideoStageGeometry(
+            stageSize: CGSize(width: stageW, height: stageH),
+            uprightSourceSize: CGSize(width: srcW, height: srcH),
+            imageRect: imageRect,
+            visibleRect: visibleRect.isNull ? .zero : visibleRect
+        )
+    }
+
+    func normalizedAim(forStagePoint point: CGPoint) -> CGPoint? {
+        guard visibleRect.width > 0,
+              visibleRect.height > 0,
+              imageRect.width > 0,
+              imageRect.height > 0,
+              visibleRect.contains(point) else {
+            return nil
+        }
+        let u = (point.x - imageRect.minX) / imageRect.width
+        let v = (point.y - imageRect.minY) / imageRect.height
+        return CGPoint(
+            x: max(-1.0, min(1.0, 2.0 * u - 1.0)),
+            y: max(-1.0, min(1.0, 2.0 * v - 1.0))
+        )
+    }
+
+    func stagePoint(forNormalizedAim aim: CGPoint) -> CGPoint? {
+        guard visibleRect.width > 0,
+              visibleRect.height > 0,
+              imageRect.width > 0,
+              imageRect.height > 0 else {
+            return nil
+        }
+        let u = (aim.x + 1.0) * 0.5
+        let v = (aim.y + 1.0) * 0.5
+        let pt = CGPoint(
+            x: imageRect.minX + u * imageRect.width,
+            y: imageRect.minY + v * imageRect.height
+        )
+        guard visibleRect.contains(pt) else {
+            return nil
+        }
+        return pt
+    }
+
+    func tofGridRect() -> CGRect {
+        guard imageRect.width > 0, imageRect.height > 0 else { return .zero }
+        let side = min(imageRect.width, imageRect.height) * 0.62
+        return CGRect(
+            x: imageRect.midX - side * 0.5,
+            y: imageRect.midY - side * 0.5,
+            width: side,
+            height: side
+        )
+    }
 }
 
 // MARK: - system.* & robot.health
@@ -1341,5 +1605,22 @@ enum QuackMath {
         let pitch = atan2(gx, -gz) * radToDeg
         let roll = atan2(gy, hypot(gx, gz)) * radToDeg
         return (pitch, roll)
+    }
+}
+
+extension CockpitState {
+    var runningKickSide: KickSide? {
+        guard case .runningSkill(let name) = self else { return nil }
+        return KickSide(rawValue: name)
+    }
+
+    var isRunningKick: Bool {
+        runningKickSide != nil
+    }
+
+    /// Projects a brief one-shot kick onto `.walking(hasSitstand:)` for layout stability
+    /// so driving controls and posture slots do not tear down during a 0.5 s kick.
+    func layoutProjected(hasSitstand: Bool) -> CockpitState {
+        isRunningKick ? .walking(hasSitstand: hasSitstand) : self
     }
 }

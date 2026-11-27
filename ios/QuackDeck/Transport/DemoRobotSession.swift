@@ -9,6 +9,7 @@ final class DemoRobotSession: RobotSessionTransport {
         case homing(startedAt: Date, targetSeated: Bool)
         case held(sitting: Bool)
         case walking
+        case kicking(side: KickSide, startedAt: Date)
         case sitting(startedAt: Date)
         case rising(startedAt: Date)
         case autoRisingFromSeat(startedAt: Date)
@@ -20,6 +21,22 @@ final class DemoRobotSession: RobotSessionTransport {
         case fallRetry(startedAt: Date, attempt: Int)
     }
 
+    private struct ActiveDemoEmotion: Equatable {
+        let name: String
+        let startedAt: Date
+        let duration: TimeInterval
+    }
+
+    private struct EmotionOffsets {
+        let bodyPitchRad: Double
+        let bodyRollRad: Double
+        let neckPitch: Double
+        let headPitch: Double
+        let headYaw: Double
+        let headRoll: Double
+        let mouthAngle: Double
+    }
+
     private struct WirePhaseKey: Equatable {
         let policy: String
         let homed: Bool
@@ -27,6 +44,7 @@ final class DemoRobotSession: RobotSessionTransport {
         let limp: Bool
         let fallen: Bool
         let pickedUp: Bool
+        let activeEmotionName: String?
     }
 
     private(set) var phase: ConnectionPhase = .disconnected
@@ -45,6 +63,9 @@ final class DemoRobotSession: RobotSessionTransport {
     private(set) var virtualYawDeg: Double = 0
     private(set) var virtualGazeNormalized: (x: Double, y: Double) = (0, 0)
     private(set) var lastQuackAt: Date?
+    private(set) var activeDemoEmotionName: String?
+    private(set) var activeDemoKickSide: KickSide?
+    private(set) var lastDroppedEmotionName: String?
 
     private let startWalkingOnConnect: Bool
     private var simMode: DemoSimMode = .limp
@@ -56,6 +77,9 @@ final class DemoRobotSession: RobotSessionTransport {
     private var simPickedUp: Bool = false
     private var simHasSitstand: Bool = true
     private var simHasWalkPolicy: Bool = true
+    private var simKickSides: Set<KickSide> = [.left, .right]
+    private var simEmotions: [String] = MicroduckEmotions.defaultShippedNames
+    private var activeEmotion: ActiveDemoEmotion?
     private var pendingEnableWhenImuReady: Bool = false
 
     private var sensorsVisible: Bool = false
@@ -89,6 +113,10 @@ final class DemoRobotSession: RobotSessionTransport {
         simPickedUp = false
         simHasSitstand = true
         simHasWalkPolicy = true
+        simKickSides = [.left, .right]
+        simEmotions = MicroduckEmotions.defaultShippedNames
+        clearActiveEmotionState(clearDropped: true)
+        activeDemoKickSide = nil
         pendingEnableWhenImuReady = false
         commandMove = (0, 0, 0)
         commandLook = (0, LiveRobotSession.lookCenterPoint.z)
@@ -219,7 +247,7 @@ final class DemoRobotSession: RobotSessionTransport {
                 } else {
                     simMode = .walking
                 }
-            case .walking, .sitting, .rising, .autoRisingFromSeat, .limpFall, .limpPose, .fallRetry:
+            case .walking, .kicking, .sitting, .rising, .autoRisingFromSeat, .limpFall, .limpPose, .fallRetry:
                 break
             case .resting:
                 return IntentResult(accepted: false, reason: "Robot is resting.")
@@ -232,6 +260,8 @@ final class DemoRobotSession: RobotSessionTransport {
             pendingEnableWhenImuReady = false
             simPickedUp = false
             commandMove = (0, 0, 0)
+            clearActiveEmotionState(clearDropped: true)
+            activeDemoKickSide = nil
             let now = Date()
             switch simMode {
             case .limp, .homing, .resting, .shuttingDown, .shuttingDownImmediate:
@@ -242,7 +272,7 @@ final class DemoRobotSession: RobotSessionTransport {
                 simMode = .held(sitting: now.timeIntervalSince(startedAt) < 2.0)
             case .held(let sitting):
                 simMode = .held(sitting: sitting)
-            case .walking, .rising, .limpFall, .limpPose, .fallRetry:
+            case .walking, .kicking, .rising, .limpFall, .limpPose, .fallRetry:
                 simMode = .held(sitting: false)
             }
             publishImmediateWireSnapshot()
@@ -268,15 +298,75 @@ final class DemoRobotSession: RobotSessionTransport {
             return IntentResult(accepted: true)
         case .rising, .autoRisingFromSeat:
             return IntentResult(accepted: true)
+        case .kicking:
+            return IntentResult(accepted: false, reason: "robot is busy kicking")
         default:
             return IntentResult(accepted: false, reason: "the policy is not driving")
         }
+    }
+
+    func triggerKick(_ side: KickSide) async -> IntentResult {
+        guard phase.isConnected else {
+            return IntentResult(accepted: false, reason: "Connect to the robot first.")
+        }
+        guard simKickSides.contains(side) else {
+            return IntentResult(accepted: false, reason: "no skill named \"\(side.skillName)\"")
+        }
+        guard simMode == .walking, !simFallen, !simPickedUp else {
+            return IntentResult(accepted: false, reason: "the policy is not driving")
+        }
+        guard activeEmotion == nil else {
+            return IntentResult(accepted: false, reason: "another skill is already playing")
+        }
+        commandMove = (0, 0, 0)
+        activeDemoKickSide = side
+        simMode = .kicking(side: side, startedAt: Date())
+        publishImmediateWireSnapshot()
+        return IntentResult(accepted: true)
+    }
+
+    func triggerEmotion(_ name: String) async -> IntentResult {
+        guard phase.isConnected else {
+            return IntentResult(accepted: false, reason: "Connect to the robot first.")
+        }
+        guard simEmotions.contains(name) else {
+            return IntentResult(accepted: false, reason: "no skill named \"\(name)\"")
+        }
+        let isDrivingWalkingOrSitting: Bool
+        switch simMode {
+        case .walking, .sitting:
+            isDrivingWalkingOrSitting = true
+        default:
+            isDrivingWalkingOrSitting = false
+        }
+        guard isDrivingWalkingOrSitting else {
+            return IntentResult(accepted: false, reason: "the policy is not driving")
+        }
+        if activeEmotion != nil || simFallen || simPickedUp {
+            if activeEmotion != nil {
+                lastDroppedEmotionName = name
+            }
+            return IntentResult(accepted: true)
+        }
+
+        let now = Date()
+        let duration = MicroduckEmotions.knownDurationSeconds(for: name) ?? 2.5
+        activeEmotion = ActiveDemoEmotion(name: name, startedAt: now, duration: duration)
+        activeDemoEmotionName = name
+        commandMove = (0, 0, 0)
+        if MicroduckEmotions.maySitRobot(name) && simMode == .walking && simHasSitstand {
+            simMode = .sitting(startedAt: now)
+        }
+        publishImmediateWireSnapshot()
+        return IntentResult(accepted: true)
     }
 
     func sendRelax() async -> IntentResult {
         pendingEnableWhenImuReady = false
         simPickedUp = false
         commandMove = (0, 0, 0)
+        clearActiveEmotionState(clearDropped: true)
+        activeDemoKickSide = nil
         if case .resting(let startedAt, _) = simMode {
             simMode = .resting(startedAt: startedAt, torqueCut: true)
         } else if case .shuttingDown(let startedAt, _) = simMode {
@@ -294,6 +384,8 @@ final class DemoRobotSession: RobotSessionTransport {
         pendingEnableWhenImuReady = false
         simPickedUp = false
         commandMove = (0, 0, 0)
+        clearActiveEmotionState(clearDropped: true)
+        activeDemoKickSide = nil
         if case .shuttingDown = simMode {
             return IntentResult(accepted: true)
         }
@@ -302,7 +394,7 @@ final class DemoRobotSession: RobotSessionTransport {
         }
         let isDrivingState: Bool = {
             switch simMode {
-            case .walking, .sitting, .rising, .autoRisingFromSeat:
+            case .walking, .kicking, .sitting, .rising, .autoRisingFromSeat:
                 return true
             default:
                 return false
@@ -324,6 +416,7 @@ final class DemoRobotSession: RobotSessionTransport {
         pendingEnableWhenImuReady = false
         simPickedUp = false
         commandMove = (0, 0, 0)
+        clearActiveEmotionState(clearDropped: true)
 
         if case .resting(let startedAt, let torqueCut) = simMode {
             simMode = .shuttingDown(startedAt: startedAt, torqueCut: torqueCut)
@@ -385,8 +478,10 @@ final class DemoRobotSession: RobotSessionTransport {
         simFallen = fallen
         if fallen {
             commandMove = (0, 0, 0)
+            clearActiveEmotionState(clearDropped: false)
+            activeDemoKickSide = nil
             switch simMode {
-            case .walking, .sitting, .rising, .autoRisingFromSeat:
+            case .walking, .kicking, .sitting, .rising, .autoRisingFromSeat:
                 simMode = recovering ? .limpFall(startedAt: Date(), attempt: 1) : .held(sitting: false)
             default:
                 break
@@ -406,12 +501,33 @@ final class DemoRobotSession: RobotSessionTransport {
         simPickedUp = pickedUp
         if pickedUp {
             commandMove = (0, 0, 0)
+            clearActiveEmotionState(clearDropped: false)
+            activeDemoKickSide = nil
+            if case .kicking = simMode {
+                simMode = .walking
+            }
         }
         publishImmediateWireSnapshot()
     }
 
     func simulateNoSitstand(_ disabled: Bool = true) {
         simHasSitstand = !disabled
+        publishImmediateWireSnapshot()
+    }
+
+    func simulateKickSides(_ sides: Set<KickSide>) {
+        simKickSides = sides
+        if let active = activeDemoKickSide, !sides.contains(active) {
+            activeDemoKickSide = nil
+            if case .kicking = simMode {
+                simMode = .walking
+            }
+        }
+        publishImmediateWireSnapshot()
+    }
+
+    func simulateEmotions(_ names: [String]) {
+        simEmotions = names
         publishImmediateWireSnapshot()
     }
 
@@ -485,6 +601,8 @@ final class DemoRobotSession: RobotSessionTransport {
     func disconnect() async {
         simTask?.cancel()
         simTask = nil
+        clearActiveEmotionState(clearDropped: true)
+        activeDemoKickSide = nil
         videoSource = .none
         phase = .disconnected
         telemetry = TelemetrySnapshot()
@@ -537,7 +655,8 @@ final class DemoRobotSession: RobotSessionTransport {
             sitting: wire.sitting,
             limp: wire.isLimp,
             fallen: wire.isFallen,
-            pickedUp: wire.isPickedUp
+            pickedUp: wire.isPickedUp,
+            activeEmotionName: activeDemoEmotionName
         )
     }
 
@@ -550,6 +669,13 @@ final class DemoRobotSession: RobotSessionTransport {
         case .autoRisingFromSeat(let startedAt):
             if now.timeIntervalSince(startedAt) >= 3.0 {
                 simMode = .walking
+            }
+        case .walking:
+            break
+        case .kicking(_, let startedAt):
+            if simFallen || simPickedUp || now.timeIntervalSince(startedAt) >= MicroduckKicks.durationSeconds {
+                simMode = .walking
+                activeDemoKickSide = nil
             }
         case .rising(let startedAt):
             if now.timeIntervalSince(startedAt) >= 1.0 {
@@ -588,15 +714,31 @@ final class DemoRobotSession: RobotSessionTransport {
         default:
             break
         }
+
+        if let emotion = activeEmotion {
+            let isWalkingOrSitting: Bool
+            switch simMode {
+            case .walking, .sitting:
+                isWalkingOrSitting = true
+            default:
+                isWalkingOrSitting = false
+            }
+            if simFallen || simPickedUp || !isWalkingOrSitting || now.timeIntervalSince(emotion.startedAt) >= emotion.duration {
+                clearActiveEmotionState(clearDropped: false)
+            }
+        }
     }
 
     private func finishSimulatedShutdown() {
         simTask?.cancel()
         simTask = nil
+        clearActiveEmotionState(clearDropped: true)
+        activeDemoKickSide = nil
         simMode = .limp
         videoSource = .none
         var poweredOffSnapshot = TelemetrySnapshot()
         poweredOffSnapshot.isPoweredOff = true
+        poweredOffSnapshot.shutdownOutcome = .confirmedPoweredOff
         telemetry = poweredOffSnapshot
         phase = .disconnected
         onStateUpdated?()
@@ -666,7 +808,7 @@ final class DemoRobotSession: RobotSessionTransport {
                     activeMove: (0, 0, 0)
                 )
             }
-            let move = simFallen ? (0.0, 0.0, 0.0) : commandMove
+            let move = (simFallen || activeEmotion != nil) ? (0.0, 0.0, 0.0) : commandMove
             return ResolvedSimWire(
                 policyName: "walk",
                 homed: true,
@@ -680,6 +822,37 @@ final class DemoRobotSession: RobotSessionTransport {
                 isCrouched: false,
                 gain: 650,
                 activeMove: move
+            )
+        case .kicking(let side, _):
+            if simPickedUp && !simFallen {
+                return ResolvedSimWire(
+                    policyName: "held",
+                    homed: true,
+                    sitting: false,
+                    isLimp: false,
+                    isFallen: false,
+                    isPickedUp: true,
+                    isTorqueOn: true,
+                    isHeadDriving: false,
+                    isWalkingGait: false,
+                    isCrouched: false,
+                    gain: 650,
+                    activeMove: (0, 0, 0)
+                )
+            }
+            return ResolvedSimWire(
+                policyName: side.skillName,
+                homed: true,
+                sitting: false,
+                isLimp: false,
+                isFallen: simFallen,
+                isPickedUp: false,
+                isTorqueOn: true,
+                isHeadDriving: !simFallen,
+                isWalkingGait: false,
+                isCrouched: false,
+                gain: 650,
+                activeMove: (0, 0, 0)
             )
         case .sitting:
             if simPickedUp && !simFallen {
@@ -855,14 +1028,25 @@ final class DemoRobotSession: RobotSessionTransport {
                 origin: simHasSitstand ? "official" : nil
             )
         ]
-        if !simHasSitstand {
-            slots[1] = PolicySlot(slot: "sitstand", path: nil, origin: nil)
+        var policySkills: [String] = []
+        for side in KickSide.allCases {
+            let loaded = simKickSides.contains(side)
+            slots.append(
+                PolicySlot(
+                    slot: side.skillName,
+                    path: loaded ? "ball_\(side.rawValue).onnx" : nil,
+                    origin: loaded ? "official" : nil
+                )
+            )
+            if loaded {
+                policySkills.append(side.skillName)
+            }
         }
         telemetry.policies = PoliciesResult(
             mode: "walk",
             enabled: simHasWalkPolicy,
             slots: slots,
-            skills: [],
+            skills: policySkills,
             homed: wire.homed,
             sitting: wire.sitting,
             change_error: nil
@@ -873,7 +1057,7 @@ final class DemoRobotSession: RobotSessionTransport {
             stand: nil,
             sitstand: simHasSitstand ? "alpha_sitstand.onnx" : nil,
             ground_pick: nil,
-            skills: [],
+            skills: policySkills + simEmotions,
             unavailable: simHasWalkPolicy ? nil : "no policy configured; holding the startup pose"
         )
     }
@@ -882,6 +1066,8 @@ final class DemoRobotSession: RobotSessionTransport {
         let healthy = !simHardBlocked
         let degraded = simHardBlocked
         let reason: String? = simHardBlocked ? (simBlockReason ?? "battery: 8.4 V too low; torque stays off") : nil
+        telemetry.lastHealthUptime = ProcessInfo.processInfo.systemUptime
+        telemetry.isHealthStale = false
         telemetry.health = HealthResult(
             healthy: healthy,
             degraded: degraded,
@@ -946,14 +1132,25 @@ final class DemoRobotSession: RobotSessionTransport {
         let isWalking = wire.isWalkingGait && speed > 0.02
 
         // Body attitude
-        let pitchRad: Double
-        let rollRad: Double
+        let emo = activeEmotion.map { emotionOffsets(for: $0, now: now) }
+        let activeKick: (side: KickSide, progress: Double)? = {
+            guard case .kicking(let side, let startedAt) = simMode else { return nil }
+            let progress = max(0.0, min(1.0, now.timeIntervalSince(startedAt) / MicroduckKicks.durationSeconds))
+            return (side, progress)
+        }()
+        var pitchRad: Double
+        var rollRad: Double
         if wire.isFallen {
             pitchRad = 1.05
             rollRad = 0.25
         } else if !wire.isTorqueOn {
             pitchRad = 0.05
             rollRad = 0.03
+        } else if let activeKick {
+            let swing = sin(activeKick.progress * .pi)
+            pitchRad = -0.06 * swing
+            // Counter-roll onto stance foot while kicking
+            rollRad = (activeKick.side == .left ? -0.14 : 0.14) * swing
         } else if isWalking {
             pitchRad = -activeMove.0 * 0.22 + sin(walkPhase) * 0.025
             rollRad = activeMove.1 * 0.25 + cos(walkPhase) * 0.035
@@ -961,13 +1158,35 @@ final class DemoRobotSession: RobotSessionTransport {
             pitchRad = sin(elapsed * 0.8) * 0.014
             rollRad = cos(elapsed * 0.6) * 0.012
         }
+        if let emo, wire.isTorqueOn && !wire.isFallen {
+            pitchRad += emo.bodyPitchRad
+            rollRad += emo.bodyRollRad
+        }
 
         virtualPitchDeg = pitchRad * 180.0 / .pi
         virtualRollDeg = rollRad * 180.0 / .pi
         virtualYawDeg = odomYaw * 180.0 / .pi
 
-        let headYaw = wire.isHeadDriving ? max(-0.85, min(0.85, commandLook.y / 0.7 * 0.65)) : 0.0
-        let headPitch = wire.isHeadDriving ? max(-0.45, min(0.45, -(commandLook.z - 0.2) / 0.45 * 0.35)) : 0.0
+        let baseHeadYaw = wire.isHeadDriving ? max(-0.85, min(0.85, commandLook.y / 0.7 * 0.65)) : 0.0
+        let baseHeadPitch = wire.isHeadDriving ? max(-0.45, min(0.45, -(commandLook.z - 0.2) / 0.45 * 0.35)) : 0.0
+        let headYaw = wire.isHeadDriving ? max(-0.85, min(0.85, baseHeadYaw + (emo?.headYaw ?? 0.0))) : 0.0
+        let headPitch = wire.isHeadDriving ? max(-0.45, min(0.45, baseHeadPitch + (emo?.headPitch ?? 0.0))) : 0.0
+        let headRoll = wire.isHeadDriving ? (emo?.headRoll ?? 0.0) : 0.0
+        let neckPitch = wire.isHeadDriving ? (0.08 + (emo?.neckPitch ?? 0.0)) : 0.08
+        let mouthAngle = wire.isHeadDriving ? (emo?.mouthAngle ?? 0.0) : 0.0
+
+        if let emo, wire.isHeadDriving {
+            _ = emo
+            virtualGazeNormalized = (
+                x: max(-1, min(1, -headYaw / 0.65)),
+                y: max(-1, min(1, -headPitch / 0.35))
+            )
+        } else if activeEmotion == nil {
+            virtualGazeNormalized = (
+                x: max(-1, min(1, -commandLook.y / LiveRobotSession.lookRange.y)),
+                y: max(-1, min(1, -(commandLook.z - LiveRobotSession.lookRange.z) / LiveRobotSession.lookRange.dz))
+            )
+        }
 
         // Publish RobotState at 10 Hz (Sensors open), 2 Hz (Live), or immediately on mode change
         let stateDivider: UInt64 = sensorsVisible ? 2 : 10
@@ -983,8 +1202,12 @@ final class DemoRobotSession: RobotSessionTransport {
                 walkPhase: walkPhase,
                 speed: speed,
                 isWalking: isWalking,
+                neckPitch: neckPitch,
                 headPitch: headPitch,
-                headYaw: headYaw
+                headYaw: headYaw,
+                headRoll: headRoll,
+                mouthAngle: mouthAngle,
+                activeKick: activeKick
             )
             if phaseChanged {
                 lastWirePhaseKey = phaseKey
@@ -1028,7 +1251,7 @@ final class DemoRobotSession: RobotSessionTransport {
         // Publish Head IMU at 10 Hz when Sensors visible
         if sensorsVisible && tickCount % 2 == 0 {
             let headQuat = quaternionFromEuler(
-                roll: rollRad + 0.02,
+                roll: rollRad + headRoll + 0.02,
                 pitch: pitchRad + headPitch,
                 yaw: odomYaw + headYaw
             ).map(Float.init)
@@ -1037,7 +1260,7 @@ final class DemoRobotSession: RobotSessionTransport {
                 at_us: UInt64(elapsed * 1_000_000),
                 t_ns: UInt64(elapsed * 1_000_000_000),
                 gyro: [
-                    Float(rollRad * 0.4),
+                    Float((rollRad + headRoll) * 0.4),
                     Float(headPitch * 0.3),
                     Float(activeMove.2)
                 ],
@@ -1062,6 +1285,154 @@ final class DemoRobotSession: RobotSessionTransport {
         }
     }
 
+    private func clearActiveEmotionState(clearDropped: Bool) {
+        activeEmotion = nil
+        activeDemoEmotionName = nil
+        if clearDropped {
+            lastDroppedEmotionName = nil
+        }
+    }
+
+    private func emotionOffsets(for emotion: ActiveDemoEmotion, now: Date) -> EmotionOffsets {
+        let t = max(0, now.timeIntervalSince(emotion.startedAt))
+        let remaining = max(0, emotion.duration - t)
+        let envelope = min(1.0, t / 0.2) * min(1.0, remaining / 0.25)
+
+        switch emotion.name {
+        case "yes", "yes_fast":
+            let freq = emotion.name == "yes_fast" ? 18.0 : 12.0
+            return EmotionOffsets(
+                bodyPitchRad: 0.06 * sin(t * freq) * envelope,
+                bodyRollRad: 0,
+                neckPitch: 0.12 * sin(t * freq) * envelope,
+                headPitch: 0.28 * sin(t * freq) * envelope,
+                headYaw: 0,
+                headRoll: 0,
+                mouthAngle: 0.25 * max(0, sin(t * freq)) * envelope
+            )
+        case "no":
+            return EmotionOffsets(
+                bodyPitchRad: 0,
+                bodyRollRad: 0,
+                neckPitch: 0,
+                headPitch: 0,
+                headYaw: 0.45 * sin(t * 14.0) * envelope,
+                headRoll: 0.08 * sin(t * 14.0) * envelope,
+                mouthAngle: 0.10 * envelope
+            )
+        case "angry":
+            return EmotionOffsets(
+                bodyPitchRad: -0.10 * envelope,
+                bodyRollRad: 0,
+                neckPitch: -0.08 * envelope,
+                headPitch: -0.18 * envelope,
+                headYaw: 0.35 * sin(t * 18.0) * envelope,
+                headRoll: 0,
+                mouthAngle: 0.45 * envelope
+            )
+        case "mock":
+            return EmotionOffsets(
+                bodyPitchRad: 0,
+                bodyRollRad: 0.05 * cos(t * 5.5) * envelope,
+                neckPitch: 0,
+                headPitch: 0.08 * sin(t * 11.0) * envelope,
+                headYaw: 0.40 * sin(t * 11.0) * envelope,
+                headRoll: 0.18 * cos(t * 5.5) * envelope,
+                mouthAngle: 0.35 * (0.5 + 0.5 * sin(t * 10.0)) * envelope
+            )
+        case "curious":
+            return EmotionOffsets(
+                bodyPitchRad: 0,
+                bodyRollRad: 0.08 * envelope,
+                neckPitch: -0.04 * envelope,
+                headPitch: -0.10 * envelope,
+                headYaw: 0.22 * sin(t * 2.5) * envelope,
+                headRoll: 0.38 * envelope,
+                mouthAngle: 0.15 * envelope
+            )
+        case "mmh":
+            return EmotionOffsets(
+                bodyPitchRad: 0.04 * envelope,
+                bodyRollRad: -0.06 * envelope,
+                neckPitch: 0.06 * envelope,
+                headPitch: 0.12 * envelope,
+                headYaw: -0.16 * envelope,
+                headRoll: -0.32 * envelope,
+                mouthAngle: 0.05 * envelope
+            )
+        case "excited":
+            return EmotionOffsets(
+                bodyPitchRad: 0.12 * sin(t * 16.0) * envelope,
+                bodyRollRad: 0.10 * cos(t * 8.0) * envelope,
+                neckPitch: -0.08 * envelope,
+                headPitch: -0.22 * abs(sin(t * 8.0)) * envelope,
+                headYaw: 0.25 * sin(t * 8.0) * envelope,
+                headRoll: 0.12 * sin(t * 8.0) * envelope,
+                mouthAngle: 0.48 * (0.5 + 0.5 * sin(t * 14.0)) * envelope
+            )
+        case "laugh":
+            return EmotionOffsets(
+                bodyPitchRad: 0.10 * sin(t * 18.0) * envelope,
+                bodyRollRad: 0.06 * cos(t * 9.0) * envelope,
+                neckPitch: -0.06 * envelope,
+                headPitch: -0.26 * (0.5 + 0.5 * sin(t * 15.0)) * envelope,
+                headYaw: 0,
+                headRoll: 0.14 * sin(t * 7.5) * envelope,
+                mouthAngle: 0.55 * (0.5 + 0.5 * sin(t * 15.0)) * envelope
+            )
+        case "impatient":
+            return EmotionOffsets(
+                bodyPitchRad: 0.05 * sin(t * 12.0) * envelope,
+                bodyRollRad: 0.11 * sin(t * 12.0) * envelope,
+                neckPitch: 0,
+                headPitch: 0.10 * sin(t * 12.0) * envelope,
+                headYaw: 0.28 * sin(t * 6.0) * envelope,
+                headRoll: 0,
+                mouthAngle: 0.20 * envelope
+            )
+        case "sad":
+            return EmotionOffsets(
+                bodyPitchRad: 0.18 * envelope,
+                bodyRollRad: 0,
+                neckPitch: 0.24 * envelope,
+                headPitch: 0.32 * envelope,
+                headYaw: 0,
+                headRoll: 0.10 * sin(t * 1.5) * envelope,
+                mouthAngle: 0.05 * envelope
+            )
+        case "devastated":
+            return EmotionOffsets(
+                bodyPitchRad: 0.24 * envelope,
+                bodyRollRad: 0,
+                neckPitch: 0.30 * envelope,
+                headPitch: 0.38 * envelope,
+                headYaw: 0.15 * sin(t * 2.0) * envelope,
+                headRoll: 0,
+                mouthAngle: 0.35 * envelope
+            )
+        case "defiant":
+            return EmotionOffsets(
+                bodyPitchRad: -0.14 * envelope,
+                bodyRollRad: 0,
+                neckPitch: -0.16 * envelope,
+                headPitch: -0.28 * envelope,
+                headYaw: 0.18 * sin(t * 3.0) * envelope,
+                headRoll: -0.12 * envelope,
+                mouthAngle: 0.22 * envelope
+            )
+        default:
+            return EmotionOffsets(
+                bodyPitchRad: 0.05 * sin(t * 6.0) * envelope,
+                bodyRollRad: 0.05 * cos(t * 4.0) * envelope,
+                neckPitch: 0,
+                headPitch: 0.18 * sin(t * 6.0) * envelope,
+                headYaw: 0.16 * sin(t * 3.0) * envelope,
+                headRoll: 0.16 * cos(t * 4.0) * envelope,
+                mouthAngle: 0.25 * envelope
+            )
+        }
+    }
+
     private func publishRobotState(
         elapsed: TimeInterval,
         wire: ResolvedSimWire,
@@ -1070,8 +1441,12 @@ final class DemoRobotSession: RobotSessionTransport {
         walkPhase: Double = 0,
         speed: Double = 0,
         isWalking: Bool = false,
+        neckPitch: Double = 0.08,
         headPitch: Double = 0,
-        headYaw: Double = 0
+        headYaw: Double = 0,
+        headRoll: Double = 0,
+        mouthAngle: Double = 0,
+        activeKick: (side: KickSide, progress: Double)? = nil
     ) {
         let bodyQuat = quaternionFromEuler(roll: rollRad, pitch: pitchRad, yaw: odomYaw)
         let gravity = [
@@ -1079,7 +1454,7 @@ final class DemoRobotSession: RobotSessionTransport {
             sin(rollRad) * cos(pitchRad),
             -cos(rollRad) * cos(pitchRad)
         ]
-        let headAngles = [0.08, headPitch, headYaw, 0.0]
+        let headAngles = [neckPitch, headPitch, headYaw, headRoll]
 
         var joints = [Double](repeating: 0, count: 15)
         var targets = [Double](repeating: 0, count: 15)
@@ -1092,7 +1467,7 @@ final class DemoRobotSession: RobotSessionTransport {
 
             if idx >= 5 && idx <= 9 {
                 let hIdx = idx - 5
-                targetAngle = hIdx < 4 ? headAngles[hIdx] : 0.0
+                targetAngle = hIdx < 4 ? headAngles[hIdx] : mouthAngle
                 baseAngle = targetAngle + sin(elapsed * 2.1 + Double(idx)) * 0.008
                 baseCurrent = wire.isTorqueOn ? (110 + Double(hIdx == 1 ? 75 : 25)) : 8
             } else {
@@ -1103,11 +1478,22 @@ final class DemoRobotSession: RobotSessionTransport {
                 let kneeOffset = wire.isCrouched ? 1.05 : 0.58
                 let ankleOffset = wire.isCrouched ? -0.58 : -0.30
                 let hipOffset = wire.isCrouched ? -0.52 : -0.28
+                let kickSwing: Double = {
+                    guard let activeKick else { return 0.0 }
+                    let isLeftLeg = idx < 5
+                    let matchesFoot = (activeKick.side == .left && isLeftLeg) || (activeKick.side == .right && !isLeftLeg)
+                    guard matchesFoot else { return 0.0 }
+                    let env = sin(activeKick.progress * .pi)
+                    if idx == 2 || idx == 12 { return -0.55 * env } // hip pitch swing forward
+                    if idx == 3 || idx == 13 { return -0.35 * env } // knee extension
+                    if idx == 4 || idx == 14 { return 0.25 * env }  // ankle pitch
+                    return 0.0
+                }()
                 let homeOffset = isKnee ? kneeOffset : (isAnkle ? ankleOffset : (idx == 2 || idx == 12 ? hipOffset : 0.0))
-                targetAngle = homeOffset + stride
+                targetAngle = homeOffset + stride + kickSwing
                 baseAngle = targetAngle + (!wire.isTorqueOn ? 0.04 : sin(elapsed * 3.0 + Double(idx)) * 0.01)
                 let activeLoad = isKnee ? 340.0 : (isAnkle ? 260.0 : 190.0)
-                baseCurrent = !wire.isTorqueOn ? 6.0 : activeLoad + (isWalking ? abs(stride) * 1800.0 : 0.0)
+                baseCurrent = !wire.isTorqueOn ? 6.0 : activeLoad + (isWalking ? abs(stride) * 1800.0 : 0.0) + abs(kickSwing) * 950.0
             }
             joints[idx] = baseAngle
             targets[idx] = targetAngle
@@ -1120,6 +1506,8 @@ final class DemoRobotSession: RobotSessionTransport {
         if wire.isFallen { limitedBy.append("fallen") }
         if wire.isPickedUp { limitedBy.append("picked_up") }
 
+        telemetry.lastRobotStateUptime = ProcessInfo.processInfo.systemUptime
+        telemetry.isRobotStateStale = false
         telemetry.robotState = RobotState(
             t: elapsed,
             movement: MoveState(

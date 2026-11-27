@@ -513,9 +513,16 @@ struct WifiSetupView: View {
 
     private func forgetNetwork(ssid: String) async {
         do {
-            _ = try await appState.forgetWifi(ssid: ssid)
-            connectMessage = ("Removed saved network \(ssid).", false)
+            let removed = try await appState.forgetWifi(ssid: ssid)
             await runScan()
+            if removed {
+                connectMessage = ("Removed saved network \(ssid).", false)
+            } else {
+                let stillSaved = networks.first(where: { $0.ssid == ssid })?.saved ?? false
+                connectMessage = stillSaved
+                    ? ("Could not remove saved network \(ssid).", true)
+                    : ("Network \(ssid) was already absent.", false)
+            }
         } catch {
             connectMessage = (error.localizedDescription, true)
         }

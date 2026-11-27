@@ -9,8 +9,8 @@ struct LandscapeShell: View {
             let drawerWidth = min(308, max(248, geo.size.width * 0.38))
 
             ZStack(alignment: .trailing) {
-                // Full-bleed edge-to-edge video canvas
-                VideoStageView(appState: appState)
+                // Full-bleed edge-to-edge video canvas (always Fill in Landscape)
+                VideoStageView(appState: appState, framing: .fill)
                     .ignoresSafeArea()
 
                 // Subtle top & bottom legibility gradients
@@ -38,7 +38,8 @@ struct LandscapeShell: View {
                 LandscapeHudOverlay(
                     appState: appState,
                     isSensorsDrawerOpen: $isSensorsDrawerOpen,
-                    drawerWidth: drawerWidth
+                    drawerWidth: drawerWidth,
+                    stageWidth: geo.size.width
                 )
 
                 // Right-side slide-over frosted glass Sensors drawer

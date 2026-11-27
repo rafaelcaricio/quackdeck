@@ -7,6 +7,11 @@ struct VirtualStickView: View {
 
     @State private var dragOffset: CGSize = .zero
     @State private var isDragging: Bool = false
+    @State private var requiresFreshTouch: Bool = false
+
+    private var isInhibited: Bool {
+        appState.isDrivingInputInhibited
+    }
 
     private var maxRadius: CGFloat {
         size * 0.33
@@ -73,10 +78,23 @@ struct VirtualStickView: View {
                 .offset(dragOffset)
         }
         .frame(width: size, height: size)
+        .opacity(isInhibited ? 0.45 : 1.0)
         .contentShape(Circle())
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
+                    guard !isInhibited else {
+                        requiresFreshTouch = true
+                        if isDragging {
+                            isDragging = false
+                            withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
+                                dragOffset = .zero
+                            }
+                        }
+                        return
+                    }
+                    guard !requiresFreshTouch else { return }
+
                     if !isDragging {
                         isDragging = true
                         QuackHaptics.light()
@@ -101,6 +119,7 @@ struct VirtualStickView: View {
                     appState.updateDriveStick(forward: forward, strafeLeft: strafeLeft)
                 }
                 .onEnded { _ in
+                    requiresFreshTouch = false
                     isDragging = false
                     withAnimation(.spring(response: 0.24, dampingFraction: 0.72)) {
                         dragOffset = .zero
@@ -108,11 +127,38 @@ struct VirtualStickView: View {
                     appState.updateDriveStick(forward: 0, strafeLeft: 0)
                 }
         )
+        .onChange(of: isInhibited) { _, inhibited in
+            if inhibited {
+                if isDragging {
+                    requiresFreshTouch = true
+                }
+                isDragging = false
+                withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
+                    dragOffset = .zero
+                }
+            }
+        }
+        .onChange(of: appState.inputResetGeneration) { _, _ in
+            if isDragging {
+                requiresFreshTouch = true
+            }
+            isDragging = false
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
+                dragOffset = .zero
+            }
+        }
         .onChange(of: appState.stickForward) { _, newValue in
             if !isDragging && newValue == 0 && appState.stickStrafeLeft == 0 && dragOffset != .zero {
                 withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
                     dragOffset = .zero
                 }
+            }
+        }
+        .onDisappear {
+            if isDragging || dragOffset != .zero {
+                isDragging = false
+                dragOffset = .zero
+                appState.updateDriveStick(forward: 0, strafeLeft: 0)
             }
         }
         .accessibilityLabel("Drive thumbstick")

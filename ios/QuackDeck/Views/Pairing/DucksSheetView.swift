@@ -332,6 +332,7 @@ struct DucksSheetView: View {
 
     private func pairedDuckRow(_ duck: PairedDuck) -> some View {
         let isCurrent = !appState.isDemoMode && appState.currentRobotId == duck.robotId
+        let isRowConnecting = appState.connectingRobotId == duck.robotId
         return HStack(spacing: QuackTheme.controlSpacing) {
             Button {
                 Task {
@@ -346,9 +347,16 @@ struct DucksSheetView: View {
                 }
             } label: {
                 HStack(spacing: 10) {
-                    Circle()
-                        .fill(isCurrent && appState.isConnected ? QuackTheme.okGreen : QuackTheme.duckOrange)
-                        .frame(width: 9, height: 9)
+                    if isRowConnecting {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(QuackTheme.duckOrange)
+                            .frame(width: 9, height: 9)
+                    } else {
+                        Circle()
+                            .fill(isCurrent && appState.isConnected ? QuackTheme.okGreen : QuackTheme.duckOrange)
+                            .frame(width: 9, height: 9)
+                    }
 
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
@@ -359,9 +367,9 @@ struct DucksSheetView: View {
                                 .font(QuackTheme.monoValue(size: 11, weight: .medium))
                                 .foregroundStyle(QuackTheme.duckOrange)
                         }
-                        Text(duck.lastIp ?? "No saved IP · connects via Bluetooth")
+                        Text(isRowConnecting ? "Connecting..." : (duck.lastIp ?? "No saved IP · connects via Bluetooth"))
                             .font(QuackTheme.monoValue(size: 11, weight: .regular))
-                            .foregroundStyle(QuackTheme.creamText.opacity(0.55))
+                            .foregroundStyle(isRowConnecting ? QuackTheme.duckOrange : QuackTheme.creamText.opacity(0.55))
                     }
                     Spacer()
                 }
@@ -369,6 +377,7 @@ struct DucksSheetView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.quackRow)
+            .disabled(appState.connectingRobotId != nil)
 
             if isCurrent {
                 Button {

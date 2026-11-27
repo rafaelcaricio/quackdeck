@@ -56,9 +56,15 @@ final class LiveRobotSession: RobotSessionTransport {
     private var isConnectingLanRpcClient: Bool = false
     private var nextLanRpcId: Int = 1
 
+    private enum ShutdownPhase {
+        case idle
+        case pendingAck
+        case acceptedAwaitingDisconnect
+    }
+
     private var connectGeneration: UInt64 = 0
     private var userDisconnected: Bool = false
-    private var isShutdownInProgress: Bool = false
+    private var shutdownPhase: ShutdownPhase = .idle
     private var isAttemptingConnection: Bool = false
     private var consecutiveLanFailures: Int = 0
     private var didNudgeWakeSleep: Bool = false
@@ -75,6 +81,7 @@ final class LiveRobotSession: RobotSessionTransport {
     private var hasStartedStreamsForCurrentChannel: Bool = false
     private var streamInitTask: Task<Void, Never>?
     private var healthPollTask: Task<Void, Never>?
+    private var freshnessWatchdogTask: Task<Void, Never>?
     private var tofTimestampWindow: [Date] = []
     private var lastObservedPolicy: String?
     private var policiesFetchSeq: UInt64 = 0
@@ -86,7 +93,8 @@ final class LiveRobotSession: RobotSessionTransport {
     private var moveTimerTask: Task<Void, Never>?
 
     private var lookTarget: (y: Double, z: Double)?
-    private var lookTimerTask: Task<Void, Never>?
+    private var lookSenderTask: Task<Void, Never>?
+    private var lookGestureGeneration: UInt64 = 0
 
     init(bleManager: BleManager, vault: RobotVault = .shared) {
         self.bleManager = bleManager
@@ -160,7 +168,8 @@ final class LiveRobotSession: RobotSessionTransport {
         }
 
         userDisconnected = false
-        isShutdownInProgress = false
+        shutdownPhase = .idle
+        telemetry.shutdownOutcome = .none
         shutdownFinalizeTask?.cancel()
         shutdownFinalizeTask = nil
         connectGeneration &+= 1
@@ -282,22 +291,24 @@ final class LiveRobotSession: RobotSessionTransport {
         let clampedZ = max(minZ, min(maxZ, z))
 
         lookTarget = (clampedY, clampedZ)
-        if lookTimerTask == nil {
-            sendCurrentLook()
+        if lookSenderTask == nil {
             startLookLoop()
         }
     }
 
     func stopLook() {
+        lookGestureGeneration &+= 1
         lookTarget = nil
-        lookTimerTask?.cancel()
-        lookTimerTask = nil
+        lookSenderTask?.cancel()
+        lookSenderTask = nil
     }
 
     func lookCenter() {
         stopLook()
+        let generation = lookGestureGeneration
         telemetry.lookClamped = false
-        Task {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             let params: [String: Any] = [
                 "x": Self.lookCenterPoint.x,
                 "y": Self.lookCenterPoint.y,
@@ -305,8 +316,9 @@ final class LiveRobotSession: RobotSessionTransport {
                 "neck_pitch": 0.0
             ]
             if let data = try? await webRTC.call(method: "robot.look", params: params),
-               let result = try? JSONDecoder().decode(LookResult.self, from: data) {
-                telemetry.lookClamped = result.clamped
+               let result = try? JSONDecoder().decode(LookResult.self, from: data),
+               self.lookGestureGeneration == generation {
+                self.telemetry.lookClamped = result.clamped
             }
         }
     }
@@ -321,6 +333,14 @@ final class LiveRobotSession: RobotSessionTransport {
 
     func sendSitToggle() async -> IntentResult {
         await callPostureRpc(method: "robot.do", params: ["skill": "sit_toggle"])
+    }
+
+    func triggerEmotion(_ name: String) async -> IntentResult {
+        await callSkillRpc(skill: name)
+    }
+
+    func triggerKick(_ side: KickSide) async -> IntentResult {
+        await callSkillRpc(skill: side.skillName)
     }
 
     func sendRelax() async -> IntentResult {
@@ -344,37 +364,61 @@ final class LiveRobotSession: RobotSessionTransport {
         cancelBackgroundReconnectTasks()
 
         let generation = connectGeneration
-        isShutdownInProgress = true
+        shutdownPhase = .pendingAck
+        telemetry.shutdownOutcome = .none
+        telemetry.statusBanner = "Requesting shutdown..."
         webRTC.prepareForExpectedShutdown()
 
         do {
             let data = try await webRTC.call(method: "robot.shutdown", params: [:], timeoutSeconds: 8)
-            let result = (try? JSONDecoder().decode(IntentResult.self, from: data)) ?? IntentResult(accepted: true)
+            guard let result = try? JSONDecoder().decode(IntentResult.self, from: data) else {
+                shutdownPhase = .idle
+                webRTC.resumeAutoReconnect()
+                let message = "Invalid shutdown response from robot."
+                telemetry.shutdownOutcome = .none
+                telemetry.statusBanner = message
+                onStateUpdated?()
+                return IntentResult(accepted: false, reason: message)
+            }
             if result.accepted {
+                shutdownPhase = .acceptedAwaitingDisconnect
+                telemetry.shutdownOutcome = .requested
+                telemetry.statusBanner = "Shutdown requested..."
+                onStateUpdated?()
                 if !webRTC.isControlOpen {
-                    finalizeExpectedShutdown()
+                    finalizeConfirmedShutdown()
                 } else {
                     startShutdownFinalizeFallback(generation: generation)
                 }
                 return result
             } else {
-                isShutdownInProgress = false
+                shutdownPhase = .idle
+                telemetry.shutdownOutcome = .none
                 webRTC.resumeAutoReconnect()
                 if let reason = result.reason {
                     telemetry.statusBanner = reason
                 }
+                onStateUpdated?()
                 return result
             }
         } catch WebRTCSessionError.controlChannelClosed {
-            if isShutdownInProgress {
-                finalizeExpectedShutdown()
+            if shutdownPhase == .acceptedAwaitingDisconnect {
+                finalizeConfirmedShutdown()
                 return IntentResult(accepted: true)
+            }
+            if shutdownPhase == .pendingAck {
+                finalizeUnconfirmedShutdown()
+                return IntentResult(accepted: false, reason: "Connection lost · shutdown unconfirmed.")
             }
             return IntentResult(accepted: false, reason: WebRTCSessionError.controlChannelClosed.localizedDescription)
         } catch {
-            isShutdownInProgress = false
-            webRTC.resumeAutoReconnect()
-            telemetry.lastError = error.localizedDescription
+            if shutdownPhase == .pendingAck {
+                shutdownPhase = .idle
+                telemetry.shutdownOutcome = .none
+                webRTC.resumeAutoReconnect()
+                telemetry.lastError = error.localizedDescription
+                onStateUpdated?()
+            }
             return IntentResult(accepted: false, reason: error.localizedDescription)
         }
     }
@@ -412,7 +456,12 @@ final class LiveRobotSession: RobotSessionTransport {
         }
         do {
             let data = try await webRTC.call(method: method, params: params)
-            let result = (try? JSONDecoder().decode(IntentResult.self, from: data)) ?? IntentResult(accepted: true)
+            guard let result = try? JSONDecoder().decode(IntentResult.self, from: data) else {
+                let message = "Invalid response from robot."
+                telemetry.statusBanner = message
+                await refreshPolicies()
+                return IntentResult(accepted: false, reason: message)
+            }
             if !result.accepted, let reason = result.reason {
                 telemetry.statusBanner = reason
             }
@@ -421,6 +470,36 @@ final class LiveRobotSession: RobotSessionTransport {
         } catch {
             telemetry.lastError = error.localizedDescription
             await refreshPolicies()
+            return IntentResult(accepted: false, reason: error.localizedDescription)
+        }
+    }
+
+    private func callSkillRpc(skill: String) async -> IntentResult {
+        guard webRTC.isControlOpen else {
+            return IntentResult(accepted: false, reason: "Connect to the robot first.")
+        }
+        do {
+            let data = try await webRTC.call(method: "robot.do", params: ["skill": skill])
+            guard let result = try? JSONDecoder().decode(IntentResult.self, from: data) else {
+                let message = "Invalid response from robot."
+                telemetry.statusBanner = message
+                Task { [weak self] in
+                    await self?.refreshPolicies()
+                }
+                return IntentResult(accepted: false, reason: message)
+            }
+            if !result.accepted, let reason = result.reason {
+                telemetry.statusBanner = reason
+            }
+            Task { [weak self] in
+                await self?.refreshPolicies()
+            }
+            return result
+        } catch {
+            telemetry.lastError = error.localizedDescription
+            Task { [weak self] in
+                await self?.refreshPolicies()
+            }
             return IntentResult(accepted: false, reason: error.localizedDescription)
         }
     }
@@ -503,7 +582,8 @@ final class LiveRobotSession: RobotSessionTransport {
 
     func disconnect() async {
         userDisconnected = true
-        isShutdownInProgress = false
+        shutdownPhase = .idle
+        telemetry.shutdownOutcome = .none
         shutdownFinalizeTask?.cancel()
         shutdownFinalizeTask = nil
         connectGeneration &+= 1
@@ -537,7 +617,8 @@ final class LiveRobotSession: RobotSessionTransport {
         peripheralId: UUID?
     ) {
         userDisconnected = false
-        isShutdownInProgress = false
+        shutdownPhase = .idle
+        telemetry.shutdownOutcome = .none
         shutdownFinalizeTask?.cancel()
         shutdownFinalizeTask = nil
         connectGeneration &+= 1
@@ -1319,6 +1400,8 @@ final class LiveRobotSession: RobotSessionTransport {
         streamInitTask = nil
         healthPollTask?.cancel()
         healthPollTask = nil
+        freshnessWatchdogTask?.cancel()
+        freshnessWatchdogTask = nil
         headImuSubscribedOnSession = false
         hasStartedStreamsForCurrentChannel = false
         lastObservedPolicy = nil
@@ -1384,6 +1467,12 @@ final class LiveRobotSession: RobotSessionTransport {
             self.videoSource = track.map { .webrtc(track: $0) } ?? .none
         }
 
+        webRTC.onFirstFrameTimeoutChanged = { [weak self] timedOut in
+            guard let self else { return }
+            self.telemetry.isVideoFirstFrameTimedOut = timedOut
+            self.onStateUpdated?()
+        }
+
         webRTC.onControlChannelOpen = { [weak self] in
             guard let self, !self.hasStartedStreamsForCurrentChannel else { return }
             let generation = self.connectGeneration
@@ -1406,6 +1495,12 @@ final class LiveRobotSession: RobotSessionTransport {
             self.telemetry.reconnectAttempt = 0
             self.telemetry.nextRetrySeconds = nil
             self.telemetry.isAutoReconnecting = false
+            self.telemetry.isRobotStateStale = false
+            self.telemetry.isHealthStale = false
+            self.telemetry.lastRobotStateUptime = nil
+            self.telemetry.lastHealthUptime = nil
+            self.telemetry.isVideoFirstFrameTimedOut = false
+            self.telemetry.shutdownOutcome = .none
 
             self.phase = .connected(transportLabel: "LAN")
             self.onStateUpdated?()
@@ -1422,8 +1517,12 @@ final class LiveRobotSession: RobotSessionTransport {
 
         webRTC.onControlChannelClosed = { [weak self] in
             guard let self else { return }
-            if self.isShutdownInProgress {
-                self.finalizeExpectedShutdown()
+            if self.shutdownPhase == .acceptedAwaitingDisconnect {
+                self.finalizeConfirmedShutdown()
+                return
+            }
+            if self.shutdownPhase == .pendingAck {
+                self.finalizeUnconfirmedShutdown()
                 return
             }
             self.hasStartedStreamsForCurrentChannel = false
@@ -1431,6 +1530,10 @@ final class LiveRobotSession: RobotSessionTransport {
             self.telemetry.policies = nil
             self.telemetry.subscribeAck = nil
             self.telemetry.robotState = nil
+            self.telemetry.isRobotStateStale = false
+            self.telemetry.isHealthStale = false
+            self.telemetry.lastRobotStateUptime = nil
+            self.telemetry.lastHealthUptime = nil
             if self.phase.isConnected {
                 self.phase = .connectingVideo
             }
@@ -1442,7 +1545,7 @@ final class LiveRobotSession: RobotSessionTransport {
         }
 
         webRTC.onReconnecting = { [weak self] attempt, delaySeconds, reason in
-            guard let self, !self.userDisconnected, !self.isShutdownInProgress else { return }
+            guard let self, !self.userDisconnected, self.shutdownPhase == .idle else { return }
             let generation = self.connectGeneration
             self.hasStartedStreamsForCurrentChannel = false
             self.consecutiveLanFailures += 1
@@ -1477,17 +1580,19 @@ final class LiveRobotSession: RobotSessionTransport {
             guard let self,
                   !Task.isCancelled,
                   self.connectGeneration == generation,
-                  self.isShutdownInProgress else {
+                  self.shutdownPhase == .acceptedAwaitingDisconnect else {
                 return
             }
-            self.finalizeExpectedShutdown()
+            // Do not mark confirmed power-off while the connection is still open.
+            self.telemetry.statusBanner = "Shutdown requested, but robot is still responding."
+            self.onStateUpdated?()
         }
     }
 
-    private func finalizeExpectedShutdown() {
+    private func finalizeConfirmedShutdown() {
         shutdownFinalizeTask?.cancel()
         shutdownFinalizeTask = nil
-        isShutdownInProgress = false
+        shutdownPhase = .idle
         userDisconnected = true
         connectGeneration &+= 1
         cancelBackgroundReconnectTasks()
@@ -1497,7 +1602,36 @@ final class LiveRobotSession: RobotSessionTransport {
 
         var poweredOffSnapshot = TelemetrySnapshot()
         poweredOffSnapshot.isPoweredOff = true
+        poweredOffSnapshot.shutdownOutcome = .confirmedPoweredOff
         telemetry = poweredOffSnapshot
+        videoSource = .none
+        phase = .disconnected
+        onStateUpdated?()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.bleManager.connectedPeripheralId != nil || self.bleManager.isAuthenticated {
+                await self.bleManager.disconnect()
+            }
+        }
+    }
+
+    private func finalizeUnconfirmedShutdown() {
+        shutdownFinalizeTask?.cancel()
+        shutdownFinalizeTask = nil
+        shutdownPhase = .idle
+        userDisconnected = true
+        connectGeneration &+= 1
+        cancelBackgroundReconnectTasks()
+        stopLocalMotionAndStreamLoops()
+        webRTC.stop()
+        lanRpcClient = nil
+
+        var lostSnapshot = TelemetrySnapshot()
+        lostSnapshot.isPoweredOff = false
+        lostSnapshot.shutdownOutcome = .unconfirmedLostConnection
+        lostSnapshot.statusBanner = "Connection lost · shutdown unconfirmed"
+        telemetry = lostSnapshot
         videoSource = .none
         phase = .disconnected
         onStateUpdated?()
@@ -1536,6 +1670,7 @@ final class LiveRobotSession: RobotSessionTransport {
             )
             guard !Task.isCancelled, self.webRTC.isControlOpen else { return }
             self.startHealthLoop()
+            self.startFreshnessWatchdog()
         }
     }
 
@@ -1598,7 +1733,50 @@ final class LiveRobotSession: RobotSessionTransport {
         if let data = try? await webRTC.call(method: "robot.health", timeoutSeconds: 5),
            let health = try? JSONDecoder().decode(HealthResult.self, from: data) {
             telemetry.health = health
+            telemetry.lastHealthUptime = ProcessInfo.processInfo.systemUptime
+            telemetry.isHealthStale = false
             onStateUpdated?()
+        }
+    }
+
+    private func startFreshnessWatchdog() {
+        freshnessWatchdogTask?.cancel()
+        let generation = connectGeneration
+        freshnessWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self,
+                      !Task.isCancelled,
+                      self.connectGeneration == generation,
+                      self.webRTC.isControlOpen else {
+                    break
+                }
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                var changed = false
+
+                if let lastState = self.telemetry.lastRobotStateUptime,
+                   nowUptime - lastState > 2.5,
+                   !self.telemetry.isRobotStateStale {
+                    self.telemetry.isRobotStateStale = true
+                    self.moveVector = (0, 0, 0)
+                    self.isSendingMove = false
+                    self.moveTimerTask?.cancel()
+                    self.moveTimerTask = nil
+                    self.stopLook()
+                    changed = true
+                }
+
+                if let lastHealth = self.telemetry.lastHealthUptime,
+                   nowUptime - lastHealth > 7.0,
+                   !self.telemetry.isHealthStale {
+                    self.telemetry.isHealthStale = true
+                    changed = true
+                }
+
+                if changed {
+                    self.onStateUpdated?()
+                }
+            }
         }
     }
 
@@ -1611,6 +1789,8 @@ final class LiveRobotSession: RobotSessionTransport {
             if let state = try? JSONDecoder().decode(RobotState.self, from: data) {
                 let previousPolicy = lastObservedPolicy
                 lastObservedPolicy = state.policy
+                telemetry.lastRobotStateUptime = ProcessInfo.processInfo.systemUptime
+                telemetry.isRobotStateStale = false
                 telemetry.robotState = state
                 onStateUpdated?()
                 if previousPolicy != state.policy {
@@ -1671,30 +1851,29 @@ final class LiveRobotSession: RobotSessionTransport {
     }
 
     private func startLookLoop() {
-        lookTimerTask?.cancel()
-        lookTimerTask = Task { [weak self] in
+        lookSenderTask?.cancel()
+        lookSenderTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
+                guard let self, !Task.isCancelled, let target = self.lookTarget else { break }
+                let callGen = self.lookGestureGeneration
+                if self.webRTC.isControlOpen {
+                    let params: [String: Any] = [
+                        "x": Self.lookCenterPoint.x,
+                        "y": target.y,
+                        "z": target.z,
+                        "neck_pitch": 0.0
+                    ]
+                    if let data = try? await self.webRTC.call(method: "robot.look", params: params),
+                       let result = try? JSONDecoder().decode(LookResult.self, from: data),
+                       self.lookGestureGeneration == callGen,
+                       self.lookTarget != nil {
+                        self.telemetry.lookClamped = result.clamped
+                    }
+                }
+                guard !Task.isCancelled, self.lookTarget != nil else { break }
                 try? await Task.sleep(nanoseconds: 100_000_000)
-                guard let self, !Task.isCancelled, self.lookTarget != nil else { break }
-                self.sendCurrentLook()
             }
-        }
-    }
-
-    private func sendCurrentLook() {
-        guard let target = lookTarget, webRTC.isControlOpen else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let params: [String: Any] = [
-                "x": Self.lookCenterPoint.x,
-                "y": target.y,
-                "z": target.z,
-                "neck_pitch": 0.0
-            ]
-            if let data = try? await self.webRTC.call(method: "robot.look", params: params),
-               let result = try? JSONDecoder().decode(LookResult.self, from: data) {
-                self.telemetry.lookClamped = result.clamped
-            }
+            self?.lookSenderTask = nil
         }
     }
 
@@ -1718,20 +1897,27 @@ final class LiveRobotSession: RobotSessionTransport {
                     timeoutMs: UInt64(timeoutSeconds * 1000)
                 )
             } catch {
-                // Reconnect :9444 transparently if duck-gateway closed the idle socket after 60 s.
-                guard isLanRpcSocketClosedError(error) else {
-                    throw error
-                }
-                if self.lanRpcClient === client {
+                // Retire the :9444 lane on any transport/timeout/correlation failure.
+                if !isLanRpcRemoteError(error) && self.lanRpcClient === client {
                     self.lanRpcClient = nil
                 }
-                let refreshed = try await ensureLanRpcClient(host: ip, robotId: robotId, pskHex: pskHex)
-                return try await callLanRpc(
-                    client: refreshed,
-                    method: method,
-                    params: params,
-                    timeoutMs: UInt64(timeoutSeconds * 1000)
-                )
+
+                // Only safe idempotent reads may auto-retry on a fresh :9444 connection.
+                if isLanRpcSocketClosedError(error), isIdempotentProvisioningRead(method) {
+                    let refreshed = try await ensureLanRpcClient(host: ip, robotId: robotId, pskHex: pskHex)
+                    return try await callLanRpc(
+                        client: refreshed,
+                        method: method,
+                        params: params,
+                        timeoutMs: UInt64(timeoutSeconds * 1000)
+                    )
+                }
+
+                // For Wi-Fi mutations that errored ambiguously, reconcile via net.status first.
+                if method == "net.connect" || method == "net.forget" {
+                    await refreshNetStatus()
+                }
+                throw error
             }
         }
         if webRTC.isControlOpen && (method == "net.status" || method == "net.scan") {
@@ -1761,8 +1947,24 @@ final class LiveRobotSession: RobotSessionTransport {
         return fresh
     }
 
-    private func isLanRpcSocketClosedError(_ error: Error) -> Bool {
+    private func isIdempotentProvisioningRead(_ method: String) -> Bool {
+        switch method {
+        case "net.status", "net.scan", "system.info", "robot.health":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isLanRpcRemoteError(_ error: Error) -> Bool {
         if case BleManagerError.rpcError = error {
+            return true
+        }
+        return false
+    }
+
+    private func isLanRpcSocketClosedError(_ error: Error) -> Bool {
+        if isLanRpcRemoteError(error) {
             return false
         }
         let msg = error.localizedDescription.lowercased()
@@ -1771,6 +1973,7 @@ final class LiveRobotSession: RobotSessionTransport {
             || msg.contains("read failed")
             || msg.contains("broken pipe")
             || msg.contains("connection reset")
+            || msg.contains("retired")
             || msg.contains("null handle")
     }
 
@@ -1801,6 +2004,12 @@ final class LiveRobotSession: RobotSessionTransport {
         guard let respData = responseLine.data(using: .utf8),
               let respObj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any] else {
             throw QuackCoreError.invalidResponse("Malformed JSON-RPC reply on LAN lane.")
+        }
+        guard let respId = respObj["id"] as? Int, respId == id else {
+            if self.lanRpcClient === client {
+                self.lanRpcClient = nil
+            }
+            throw QuackCoreError.invalidResponse("Mismatched JSON-RPC reply ID on LAN lane.")
         }
         if let errObj = respObj["error"] as? [String: Any] {
             let code = errObj["code"] as? Int

@@ -117,9 +117,13 @@ struct ServoLoadGridCard: View {
         let loadRatio = currentMa.map { max(0, min(1, $0 / 1200.0)) } ?? 0
         let loadColor = colorForCurrent(currentMa)
 
+        let jointDisplayName = formatJointName(name)
+        let spokenError = errorDeg.map { String(format: "%.1f degrees error", $0) } ?? "error unavailable"
+        let spokenCurrent = currentMa.map { "\(Int($0.rounded())) milliamps" } ?? "current unavailable"
+
         return VStack(spacing: 3) {
             HStack(spacing: 6) {
-                Text(formatJointName(name))
+                Text(jointDisplayName)
                     .font(.system(size: isCompact ? 11 : 12, weight: isHottest ? .bold : .medium))
                     .foregroundStyle(isHottest ? thermalColor : QuackTheme.creamText.opacity(0.88))
                     .lineLimit(1)
@@ -151,6 +155,9 @@ struct ServoLoadGridCard: View {
             }
             .frame(height: isCompact ? 3 : 4)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(jointDisplayName)\(isHottest ? ", hottest joint" : "")")
+        .accessibilityValue("\(spokenCurrent), \(spokenError)")
     }
 
     private func colorForCurrent(_ currentMa: Double?) -> Color {

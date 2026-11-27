@@ -48,12 +48,13 @@ QuackDeck pairs an adaptive SwiftUI iPhone cockpit (Portrait and Landscape) with
 
 ## Features
 
-- **Low-latency WebRTC video:** Native `VideoToolbox` H.264 decoding supporting High profile alongside constrained and baseline profiles, plus automatic camera rotation (`media.video`).
+- **Low-latency WebRTC video with Portrait framing:** Native `VideoToolbox` H.264 decoding supporting High profile alongside constrained and baseline profiles, automatic camera rotation (`media.video`), and Portrait **Full frame** vs **Fill screen** switching (corner toggle + double-tap on the video feed) that keeps the ToF depth overlay and drag-to-look gaze aligned across modes.
 - **Configurable 8×8 ToF overlay:** Live VL53L5CX depth grid rendered over the camera feed with persisted on/off and opacity controls (`5%–100%`).
-- **Adaptive touch cockpit:** No gamepad required — virtual drive thumbstick, zero-delay turn rocker, drag-to-look head aiming, and state-driven posture controls (`Init`, `Walk`, `Hold`, `Sit`, `Stand`, `Relax`, `Shut Down`).
+- **Adaptive touch cockpit:** No gamepad required — virtual drive thumbstick, zero-delay turn rocker, drag-to-look head aiming, physical left/right **Kick L** & **Kick R** actions in Portrait (`P3`) and Landscape (`L2`), and state-driven posture controls (`Init`, `Walk`, `Hold`, `Sit`, `Stand`, `Relax`, `Shut Down`).
+- **Dynamic robot emotions:** Discovers available emotion skills from the daemon (`SubscribeResult.skills` minus policy skills) and triggers `robot.do` animations in `U5 Walking` and `U6b Seated` via a floating auto-closing glass **Emote** picker (with `May sit` badges on posture-changing emotions like `devastated`).
 - **Secure onboarding & reconnect:** CoreBluetooth discovery, `md1:` QR / setup-code pairing with `Noise_NNpsk0` encryption, Wi-Fi provisioning, and bounded-backoff LAN auto-reconnect.
 - **Live telemetry dashboard:** 8×8 ToF depth heatmap, body & head IMU attitude, battery & system health, and 15-joint load/tracking-error grid.
-- **Offline Demo Mode:** Simulate video, ToF, IMUs, joints, and full posture/shutdown lifecycles without hardware.
+- **Offline Demo Mode:** Simulate video, ToF, IMUs, joints, all 13 default emotions, and full posture/shutdown lifecycles without hardware.
 
 ## Quick Start
 

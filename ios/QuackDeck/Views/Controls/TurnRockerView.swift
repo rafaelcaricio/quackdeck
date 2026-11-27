@@ -4,6 +4,7 @@ import UIKit
 enum TurnRockerStyle {
     case portraitSplit
     case landscapePill
+    case landscapeCompact
 }
 
 struct TurnRockerView: View {
@@ -11,15 +12,20 @@ struct TurnRockerView: View {
     var style: TurnRockerStyle = .portraitSplit
 
     @State private var activeDirection: Int = 0 // 1 = left (+vyaw), -1 = right (-vyaw)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isInhibited: Bool {
+        appState.isDrivingInputInhibited
+    }
 
     var body: some View {
         Group {
             switch style {
             case .portraitSplit:
                 HStack(spacing: QuackTheme.controlSpacing) {
-                    turnButton(title: "Left", direction: 1, isPill: false)
+                    turnButton(title: "Left", direction: 1, pillMode: .none)
                         .overlay {
-                            TurnHoldTouchOverlay(mode: .fixed(1)) { direction in
+                            TurnHoldTouchOverlay(mode: .fixed(1), isEnabled: !isInhibited) { direction in
                                 if direction == 0 {
                                     releaseDirection(1)
                                 } else {
@@ -28,9 +34,9 @@ struct TurnRockerView: View {
                             }
                             .accessibilityHidden(true)
                         }
-                    turnButton(title: "Right", direction: -1, isPill: false)
+                    turnButton(title: "Right", direction: -1, pillMode: .none)
                         .overlay {
-                            TurnHoldTouchOverlay(mode: .fixed(-1)) { direction in
+                            TurnHoldTouchOverlay(mode: .fixed(-1), isEnabled: !isInhibited) { direction in
                                 if direction == 0 {
                                     releaseDirection(-1)
                                 } else {
@@ -43,28 +49,64 @@ struct TurnRockerView: View {
 
             case .landscapePill:
                 HStack(spacing: 6) {
-                    turnButton(title: "Turn", direction: 1, isPill: true)
-                    turnButton(title: "Turn", direction: -1, isPill: true)
+                    turnButton(title: "Turn", direction: 1, pillMode: .standard)
+                    turnButton(title: "Turn", direction: -1, pillMode: .standard)
                 }
                 .padding(4)
                 .quackGlassPill()
                 .overlay {
-                    TurnHoldTouchOverlay(mode: .splitHorizontal) { direction in
+                    TurnHoldTouchOverlay(mode: .splitHorizontal, isEnabled: !isInhibited) { direction in
+                        applyDirection(direction)
+                    }
+                    .accessibilityHidden(true)
+                }
+
+            case .landscapeCompact:
+                HStack(spacing: 6) {
+                    turnButton(title: "L", direction: 1, pillMode: .compact)
+                    turnButton(title: "R", direction: -1, pillMode: .compact)
+                }
+                .padding(4)
+                .quackGlassPill()
+                .overlay {
+                    TurnHoldTouchOverlay(mode: .splitHorizontal, isEnabled: !isInhibited) { direction in
                         applyDirection(direction)
                     }
                     .accessibilityHidden(true)
                 }
             }
         }
+        .environment(\.layoutDirection, .leftToRight)
+        .opacity(isInhibited ? 0.45 : 1.0)
         .onChange(of: appState.turnYawLeft) { _, newValue in
             if newValue == 0 && activeDirection != 0 {
                 activeDirection = 0
             }
         }
+        .onChange(of: isInhibited) { _, inhibited in
+            if inhibited && activeDirection != 0 {
+                activeDirection = 0
+            }
+        }
+        .onChange(of: appState.inputResetGeneration) { _, _ in
+            activeDirection = 0
+        }
+        .onDisappear {
+            if activeDirection != 0 || appState.turnYawLeft != 0 {
+                activeDirection = 0
+                appState.updateTurnRocker(yawLeft: 0)
+            }
+        }
+    }
+
+    private enum PillMode {
+        case none
+        case standard
+        case compact
     }
 
     private func applyDirection(_ newDirection: Int) {
-        if newDirection == 0 {
+        if newDirection == 0 || isInhibited {
             if activeDirection != 0 {
                 activeDirection = 0
             }
@@ -87,29 +129,42 @@ struct TurnRockerView: View {
         }
     }
 
-    private func turnButton(title: String, direction: Int, isPill: Bool) -> some View {
+    private func pulseAccessibleTurn(_ direction: Int) {
+        guard !isInhibited else { return }
+        applyDirection(direction)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            releaseDirection(direction)
+        }
+    }
+
+    private func turnButton(title: String, direction: Int, pillMode: PillMode) -> some View {
         let isActive = activeDirection == direction
         let isLeft = direction > 0
         let symbolName = isLeft ? QuackIcon.turnLeft : QuackIcon.turnRight
+        let isPill = pillMode != .none
 
-        return HStack(spacing: isPill ? 5 : 6) {
+        return HStack(spacing: pillMode == .compact ? 3 : (isPill ? 5 : 6)) {
             if isLeft {
                 Image(systemName: symbolName)
-                    .font(.system(size: isPill ? 13 : 14, weight: .semibold))
+                    .font(.system(size: pillMode == .compact ? 12 : (isPill ? 13 : 14), weight: .semibold))
             }
             Text(title)
-                .font(.system(size: isPill ? 14 : 15, weight: .semibold))
+                .font(.system(size: pillMode == .compact ? 12 : (isPill ? 14 : 15), weight: .semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
             if !isLeft {
                 Image(systemName: symbolName)
-                    .font(.system(size: isPill ? 13 : 14, weight: .semibold))
+                    .font(.system(size: pillMode == .compact ? 12 : (isPill ? 13 : 14), weight: .semibold))
             }
         }
         .foregroundStyle(isActive ? QuackTheme.inkSurface : QuackTheme.creamText)
-        .padding(.horizontal, isPill ? 14 : 8)
-        .frame(minWidth: isPill ? 84 : nil, maxWidth: isPill ? nil : .infinity)
-        .frame(height: isPill ? QuackTheme.minTouchTarget : 52)
+        .padding(.horizontal, pillMode == .compact ? 6 : (isPill ? 14 : 8))
+        .frame(
+            minWidth: pillMode == .compact ? 45 : (isPill ? 84 : nil),
+            maxWidth: isPill ? nil : .infinity
+        )
+        .frame(height: pillMode == .compact ? 40 : (isPill ? QuackTheme.minTouchTarget : 52))
         .background {
             if isPill {
                 Capsule()
@@ -126,8 +181,8 @@ struct TurnRockerView: View {
                     )
             }
         }
-        .scaleEffect(isActive ? 0.96 : 1.0)
-        .animation(.easeOut(duration: 0.1), value: isActive)
+        .scaleEffect(!reduceMotion && isActive ? 0.96 : 1.0)
+        .animation(reduceMotion ? .none : .easeOut(duration: 0.1), value: isActive)
         .contentShape(
             isPill
                 ? AnyShape(Capsule())
@@ -135,7 +190,11 @@ struct TurnRockerView: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(isLeft ? "Turn left" : "Turn right")
+        .accessibilityHint("Hold to turn continuously, or activate for a short turn pulse")
         .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            pulseAccessibleTurn(direction)
+        }
     }
 }
 
@@ -157,10 +216,11 @@ private final class TurnTouchUIView: UIView {
 
 private struct TurnHoldTouchOverlay: UIViewRepresentable {
     let mode: TurnTouchMode
+    var isEnabled: Bool = true
     let onDirectionChanged: (Int) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(mode: mode, onDirectionChanged: onDirectionChanged)
+        Coordinator(mode: mode, isEnabled: isEnabled, onDirectionChanged: onDirectionChanged)
     }
 
     func makeUIView(context: Context) -> TurnTouchUIView {
@@ -168,6 +228,7 @@ private struct TurnHoldTouchOverlay: UIViewRepresentable {
         view.backgroundColor = .clear
         view.isOpaque = false
         view.isAccessibilityElement = false
+        view.isUserInteractionEnabled = isEnabled
         view.onDetach = { [weak coordinator = context.coordinator] in
             coordinator?.resetIfNeeded(async: true)
         }
@@ -188,7 +249,12 @@ private struct TurnHoldTouchOverlay: UIViewRepresentable {
 
     func updateUIView(_ uiView: TurnTouchUIView, context: Context) {
         context.coordinator.mode = mode
+        context.coordinator.isEnabled = isEnabled
         context.coordinator.onDirectionChanged = onDirectionChanged
+        uiView.isUserInteractionEnabled = isEnabled
+        if !isEnabled {
+            context.coordinator.resetIfNeeded(async: true)
+        }
     }
 
     static func dismantleUIView(_ uiView: TurnTouchUIView, coordinator: Coordinator) {
@@ -199,16 +265,22 @@ private struct TurnHoldTouchOverlay: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var mode: TurnTouchMode
+        var isEnabled: Bool
         var onDirectionChanged: (Int) -> Void
         weak var attachedView: UIView?
         private var lastDirection: Int = 0
 
-        init(mode: TurnTouchMode, onDirectionChanged: @escaping (Int) -> Void) {
+        init(mode: TurnTouchMode, isEnabled: Bool, onDirectionChanged: @escaping (Int) -> Void) {
             self.mode = mode
+            self.isEnabled = isEnabled
             self.onDirectionChanged = onDirectionChanged
         }
 
         @objc func handlePress(_ recognizer: UILongPressGestureRecognizer) {
+            guard isEnabled else {
+                resetIfNeeded(async: false)
+                return
+            }
             switch recognizer.state {
             case .began, .changed:
                 let direction: Int

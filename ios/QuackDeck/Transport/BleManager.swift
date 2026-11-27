@@ -387,9 +387,6 @@ final class BleManager: NSObject {
             throw BleManagerError.disconnected("Failed to encode JSON-RPC line.")
         }
 
-        let mtu = max(20, min(peripheral.maximumWriteValueLength(for: .withResponse), 512))
-        let chunks = try noiseSession.seal(jsonLine: jsonLine, mtu: mtu)
-
         lastActivityAt = Date()
 
         let box = BleResumableBox<String>()
@@ -408,11 +405,13 @@ final class BleManager: NSObject {
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         do {
-                            try await self.writeChunks(
-                                chunks,
+                            try await self.sealAndWriteJsonLine(
+                                jsonLine,
                                 to: peripheral,
                                 characteristic: rpcChar,
-                                generation: generation
+                                expectedSession: noiseSession,
+                                generation: generation,
+                                isAborted: { Task.isCancelled || box.isResolved }
                             )
                         } catch {
                             let mapped = self.mapBluetoothError(error)
@@ -677,6 +676,10 @@ final class BleManager: NSObject {
                 }
             }
         }
+        if Task.isCancelled {
+            releaseWriteLock(token: token)
+            throw CancellationError()
+        }
         return token
     }
 
@@ -691,6 +694,39 @@ final class BleManager: NSObject {
         }
     }
 
+    private func sealAndWriteJsonLine(
+        _ jsonLine: String,
+        to peripheral: CBPeripheral,
+        characteristic: CBCharacteristic,
+        expectedSession: BleNoiseSession,
+        generation: UInt64,
+        isAborted: () -> Bool
+    ) async throws {
+        let lockToken = try await acquireWriteLock(generation: generation)
+        defer { releaseWriteLock(token: lockToken) }
+
+        if isAborted() {
+            throw CancellationError()
+        }
+        guard connectionGeneration == generation,
+              isAuthenticated,
+              noiseSession === expectedSession,
+              activePeripheral === peripheral,
+              peripheral.state == .connected else {
+            throw BleManagerError.disconnected("Bluetooth link closed.")
+        }
+
+        let mtu = max(20, min(peripheral.maximumWriteValueLength(for: .withResponse), 512))
+        let chunks = try expectedSession.seal(jsonLine: jsonLine, mtu: mtu)
+        try await writeChunksUnlocked(
+            chunks,
+            to: peripheral,
+            characteristic: characteristic,
+            generation: generation,
+            retireLaneOnFailure: true
+        )
+    }
+
     private func writeChunks(
         _ chunks: [Data],
         to peripheral: CBPeripheral,
@@ -699,7 +735,22 @@ final class BleManager: NSObject {
     ) async throws {
         let lockToken = try await acquireWriteLock(generation: generation)
         defer { releaseWriteLock(token: lockToken) }
+        try await writeChunksUnlocked(
+            chunks,
+            to: peripheral,
+            characteristic: characteristic,
+            generation: generation,
+            retireLaneOnFailure: false
+        )
+    }
 
+    private func writeChunksUnlocked(
+        _ chunks: [Data],
+        to peripheral: CBPeripheral,
+        characteristic: CBCharacteristic,
+        generation: UInt64,
+        retireLaneOnFailure: Bool
+    ) async throws {
         for chunk in chunks {
             guard connectionGeneration == generation,
                   activePeripheral === peripheral,
@@ -707,25 +758,50 @@ final class BleManager: NSObject {
                 throw BleManagerError.disconnected("Bluetooth link closed.")
             }
 
-            try await runStepWithTimeout(
-                seconds: 6,
-                step: "writing Bluetooth packet",
-                register: { [weak self] callback in
-                    self?.writeCallback = callback
-                    return { [weak self] in
-                        self?.writeCallback = nil
+            do {
+                try await runStepWithTimeout(
+                    seconds: 6,
+                    step: "writing Bluetooth packet",
+                    register: { [weak self] callback in
+                        self?.writeCallback = callback
+                        return { [weak self] in
+                            self?.writeCallback = nil
+                        }
+                    },
+                    trigger: { [weak self] in
+                        guard let self,
+                              self.connectionGeneration == generation,
+                              self.activePeripheral === peripheral else {
+                            return
+                        }
+                        peripheral.writeValue(chunk, for: characteristic, type: .withResponse)
                     }
-                },
-                trigger: { [weak self] in
-                    guard let self,
-                          self.connectionGeneration == generation,
-                          self.activePeripheral === peripheral else {
-                        return
-                    }
-                    peripheral.writeValue(chunk, for: characteristic, type: .withResponse)
+                )
+            } catch {
+                if retireLaneOnFailure {
+                    retireAuthenticatedLane(generation: generation, error: mapBluetoothError(error))
                 }
-            )
+                throw error
+            }
             lastActivityAt = Date()
+        }
+    }
+
+    private func retireAuthenticatedLane(generation: UInt64, error: Error) {
+        guard connectionGeneration == generation else { return }
+        let retiringPeripheral = activePeripheral
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        connectionGeneration &+= 1
+        didEstablishLinkForGeneration = false
+        activeWriteLockToken = nil
+        noiseSession = nil
+        isAuthenticated = false
+        handshakeCompleted = false
+        failPendingContinuations(with: error)
+        if let retiringPeripheral,
+           retiringPeripheral.state == .connected || retiringPeripheral.state == .connecting {
+            central.cancelPeripheralConnection(retiringPeripheral)
         }
     }
 

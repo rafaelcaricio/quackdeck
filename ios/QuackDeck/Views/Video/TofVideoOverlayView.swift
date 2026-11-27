@@ -72,6 +72,8 @@ enum TofDepthPalette {
 struct TofVideoOverlayView: View {
     let frame: TofFrame
     let opacity: Double
+    var gridRect: CGRect? = nil
+    var clipRect: CGRect? = nil
 
     var body: some View {
         let clampedOpacity = AppState.clampTofOverlayOpacity(opacity)
@@ -80,80 +82,103 @@ struct TofVideoOverlayView: View {
         Canvas { context, size in
             guard size.width > 1, size.height > 1 else { return }
 
-            let cols = max(1, Int(frame.cols))
-            let rows = max(1, Int(frame.rows))
-            let isLandscape = size.width > size.height
-            let gridSide = isLandscape
-                ? min(size.width * 0.46, size.height * 0.66)
-                : min(size.width * 0.84, size.height * 0.58)
-            guard gridSide >= 48 else { return }
-
-            let originX = (size.width - gridSide) * 0.5
-            let originY = (size.height - gridSide) * 0.5
-            let gridRect = CGRect(x: originX, y: originY, width: gridSide, height: gridSide)
-
-            let gap: CGFloat = 2.5
-            let cellW = (gridSide - gap * CGFloat(max(0, cols - 1))) / CGFloat(cols)
-            let cellH = (gridSide - gap * CGFloat(max(0, rows - 1))) / CGFloat(rows)
-            let cornerRadius = max(2.0, min(5.0, min(cellW, cellH) * 0.16))
-
-            // Subtle corner brackets framing the 45°×45° ToF cone
-            drawCornerBrackets(in: &context, rect: gridRect.insetBy(dx: -5, dy: -5))
-
-            var nearestCellRect: CGRect?
-
-            for r in 0..<rows {
-                for c in 0..<cols {
-                    let idx = r * cols + c
-                    let cellRect = CGRect(
-                        x: originX + CGFloat(c) * (cellW + gap),
-                        y: originY + CGFloat(r) * (cellH + gap),
-                        width: max(1, cellW),
-                        height: max(1, cellH)
+            let drawLayerContent: (inout GraphicsContext) -> Void = { ctx in
+                let cols = max(1, Int(frame.cols))
+                let rows = max(1, Int(frame.rows))
+                let resolvedGridRect: CGRect
+                if let gridRect, gridRect.width >= 48, gridRect.height >= 48 {
+                    resolvedGridRect = gridRect
+                } else {
+                    let isLandscape = size.width > size.height
+                    let fallbackSide = isLandscape
+                        ? min(size.width * 0.46, size.height * 0.66)
+                        : min(size.width * 0.84, size.height * 0.58)
+                    guard fallbackSide >= 48 else { return }
+                    resolvedGridRect = CGRect(
+                        x: (size.width - fallbackSide) * 0.5,
+                        y: (size.height - fallbackSide) * 0.5,
+                        width: fallbackSide,
+                        height: fallbackSide
                     )
-                    let cellPath = Path(roundedRect: cellRect, cornerRadius: cornerRadius)
+                }
 
-                    if frame.isValidZone(at: idx) {
-                        let mm = Int(frame.distance_mm[idx])
-                        context.fill(cellPath, with: .color(TofDepthPalette.overlayColor(forMillimeters: mm)))
+                let gridSide = min(resolvedGridRect.width, resolvedGridRect.height)
+                guard gridSide >= 48 else { return }
+                let originX = resolvedGridRect.minX
+                let originY = resolvedGridRect.minY
 
-                        if nearest?.index == idx {
-                            nearestCellRect = cellRect
-                            context.stroke(
+                let gap: CGFloat = 2.5
+                let cellW = (gridSide - gap * CGFloat(max(0, cols - 1))) / CGFloat(cols)
+                let cellH = (gridSide - gap * CGFloat(max(0, rows - 1))) / CGFloat(rows)
+                let cornerRadius = max(2.0, min(5.0, min(cellW, cellH) * 0.16))
+
+                // Subtle corner brackets framing the 45°×45° ToF cone
+                drawCornerBrackets(in: &ctx, rect: resolvedGridRect.insetBy(dx: -5, dy: -5))
+
+                var nearestCellRect: CGRect?
+
+                for r in 0..<rows {
+                    for c in 0..<cols {
+                        let idx = r * cols + c
+                        let cellRect = CGRect(
+                            x: originX + CGFloat(c) * (cellW + gap),
+                            y: originY + CGFloat(r) * (cellH + gap),
+                            width: max(1, cellW),
+                            height: max(1, cellH)
+                        )
+                        let cellPath = Path(roundedRect: cellRect, cornerRadius: cornerRadius)
+
+                        if frame.isValidZone(at: idx) {
+                            let mm = Int(frame.distance_mm[idx])
+                            ctx.fill(cellPath, with: .color(TofDepthPalette.overlayColor(forMillimeters: mm)))
+
+                            if nearest?.index == idx {
+                                nearestCellRect = cellRect
+                                ctx.stroke(
+                                    cellPath,
+                                    with: .color(QuackTheme.creamText.opacity(0.95)),
+                                    lineWidth: 1.8
+                                )
+                            }
+                        } else {
+                            ctx.stroke(
                                 cellPath,
-                                with: .color(QuackTheme.creamText.opacity(0.95)),
-                                lineWidth: 1.8
+                                with: .color(Color.white.opacity(0.10)),
+                                lineWidth: 0.75
                             )
                         }
-                    } else {
-                        context.stroke(
-                            cellPath,
-                            with: .color(Color.white.opacity(0.10)),
-                            lineWidth: 0.75
-                        )
                     }
+                }
+
+                if let nearest, let cellRect = nearestCellRect, cellW >= 20 {
+                    let cm = Int((Double(nearest.distanceMm) / 10.0).rounded())
+                    let label = cm >= 100 ? String(format: "%.1fm", Double(cm) / 100.0) : "\(cm)cm"
+                    let text = Text(label)
+                        .font(QuackTheme.monoValue(size: 10, weight: .bold))
+                        .foregroundStyle(QuackTheme.creamText)
+                    let resolved = ctx.resolve(text)
+                    let textSize = resolved.measure(in: CGSize(width: 80, height: 20))
+                    let pillW = textSize.width + 8
+                    let pillH = textSize.height + 4
+                    let pillX = min(max(cellRect.midX - pillW * 0.5, resolvedGridRect.minX), resolvedGridRect.maxX - pillW)
+                    let preferredY = cellRect.minY - pillH - 4
+                    let pillY = preferredY >= resolvedGridRect.minY ? preferredY : cellRect.maxY + 4
+                    let pillRect = CGRect(x: pillX, y: pillY, width: pillW, height: pillH)
+                    ctx.fill(
+                        Path(roundedRect: pillRect, cornerRadius: 5),
+                        with: .color(QuackTheme.inkBg.opacity(0.82))
+                    )
+                    ctx.draw(resolved, at: CGPoint(x: pillRect.midX, y: pillRect.midY), anchor: .center)
                 }
             }
 
-            if let nearest, let cellRect = nearestCellRect, cellW >= 20 {
-                let cm = Int((Double(nearest.distanceMm) / 10.0).rounded())
-                let label = cm >= 100 ? String(format: "%.1fm", Double(cm) / 100.0) : "\(cm)cm"
-                let text = Text(label)
-                    .font(QuackTheme.monoValue(size: 10, weight: .bold))
-                    .foregroundStyle(QuackTheme.creamText)
-                let resolved = context.resolve(text)
-                let textSize = resolved.measure(in: CGSize(width: 80, height: 20))
-                let pillW = textSize.width + 8
-                let pillH = textSize.height + 4
-                let pillX = min(max(cellRect.midX - pillW * 0.5, gridRect.minX), gridRect.maxX - pillW)
-                let preferredY = cellRect.minY - pillH - 4
-                let pillY = preferredY >= gridRect.minY ? preferredY : cellRect.maxY + 4
-                let pillRect = CGRect(x: pillX, y: pillY, width: pillW, height: pillH)
-                context.fill(
-                    Path(roundedRect: pillRect, cornerRadius: 5),
-                    with: .color(QuackTheme.inkBg.opacity(0.82))
-                )
-                context.draw(resolved, at: CGPoint(x: pillRect.midX, y: pillRect.midY), anchor: .center)
+            if let clipRect, clipRect.width > 0, clipRect.height > 0 {
+                context.drawLayer { clipped in
+                    clipped.clip(to: Path(clipRect))
+                    drawLayerContent(&clipped)
+                }
+            } else {
+                drawLayerContent(&context)
             }
         }
         .opacity(clampedOpacity)

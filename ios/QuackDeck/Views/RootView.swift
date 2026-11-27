@@ -47,11 +47,20 @@ struct RootView: View {
                 syncSensorsVisibility(isLandscape: isLandscape)
             }
             .onChange(of: isLandscape) { _, newValue in
+                appState.stopAllMotion()
                 currentIsLandscape = newValue
                 syncSensorsVisibility(isLandscape: newValue)
             }
-            .onChange(of: selectedPortraitTab) { _, _ in
+            .onChange(of: selectedPortraitTab) { _, newTab in
+                if newTab != .live {
+                    appState.stopAllMotion()
+                }
                 syncSensorsVisibility(isLandscape: currentIsLandscape)
+            }
+            .onChange(of: appState.isDucksSheetPresented) { _, presented in
+                if presented {
+                    appState.stopAllMotion()
+                }
             }
             .onChange(of: isLandscapeSensorsOpen) { _, _ in
                 syncSensorsVisibility(isLandscape: currentIsLandscape)

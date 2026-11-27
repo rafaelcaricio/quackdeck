@@ -365,4 +365,138 @@ final class DemoSessionTests: XCTestCase {
 
         await appState.disconnect()
     }
+
+    func testDemoSessionDefaultEmotionsAndOlderDaemonSimulation() async throws {
+        let demo = DemoRobotSession(startWalking: true)
+        demo.connect()
+
+        XCTAssertEqual(demo.telemetry.policies?.skills, ["kick_left", "kick_right"])
+        XCTAssertEqual(demo.telemetry.subscribeAck?.skills, ["kick_left", "kick_right"] + MicroduckEmotions.defaultShippedNames)
+        XCTAssertEqual(demo.telemetry.availableEmotions, MicroduckEmotions.defaultShippedNames)
+        XCTAssertEqual(demo.telemetry.availableEmotions.count, 13)
+        XCTAssertEqual(demo.telemetry.availableKickSides, [.left, .right])
+
+        // Older daemons advertise no emotions
+        demo.simulateEmotions([])
+        XCTAssertEqual(demo.telemetry.subscribeAck?.skills, ["kick_left", "kick_right"])
+        XCTAssertEqual(demo.telemetry.availableEmotions, [])
+
+        let refusedResult = await demo.triggerEmotion("curious")
+        XCTAssertFalse(refusedResult.accepted)
+        XCTAssertNil(demo.activeDemoEmotionName)
+
+        demo.simulateEmotions(["curious", "yes"])
+        XCTAssertEqual(demo.telemetry.availableEmotions, ["curious", "yes"])
+
+        await demo.disconnect()
+    }
+
+    func testDemoSessionCuriousIgnoresStickAndDropsOverlappingRequests() async throws {
+        let demo = DemoRobotSession(startWalking: true)
+        demo.connect()
+
+        demo.setMove(vx: 0.25, vy: -0.1, vyaw: 0.8)
+        let first = await demo.triggerEmotion("curious")
+        XCTAssertTrue(first.accepted)
+        XCTAssertEqual(demo.activeDemoEmotionName, "curious")
+        XCTAssertEqual(demo.telemetry.robotState?.movement.requested, [0, 0, 0])
+        XCTAssertEqual(demo.telemetry.robotState?.movement.applied, [0, 0, 0])
+
+        // Stick updates while emotion plays must keep applied twist zeroed
+        demo.setMove(vx: 0.2, vy: 0.1, vyaw: 0.5)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(demo.activeDemoEmotionName, "curious")
+        XCTAssertEqual(demo.telemetry.robotState?.movement.applied, [0, 0, 0])
+
+        // Overlapping robot.do is accepted on RPC and dropped silently by the control loop
+        let overlap = await demo.triggerEmotion("yes")
+        XCTAssertTrue(overlap.accepted)
+        XCTAssertEqual(demo.lastDroppedEmotionName, "yes")
+        XCTAssertEqual(demo.activeDemoEmotionName, "curious")
+
+        let finished = try await waitUntil(timeoutSeconds: 4.0) {
+            demo.activeDemoEmotionName == nil
+        }
+        XCTAssertTrue(finished, "Expected curious emotion to finish within 4.0 s")
+
+        // Once emotion ends, stick velocity resumes applying
+        let resumedStick = try await waitUntil(timeoutSeconds: 1.0) {
+            (demo.telemetry.robotState?.movement.applied.first ?? 0) > 0.1
+        }
+        XCTAssertTrue(resumedStick)
+
+        await demo.disconnect()
+    }
+
+    func testDemoSessionDevastatedSitsAndYesPlaysWhileSeated() async throws {
+        let appState = AppState()
+        appState.startDemoMode(startWalking: true)
+        defer {
+            Task { @MainActor in
+                await appState.disconnect()
+            }
+        }
+
+        // devastated sits the robot from U5 Walking into U6b Seated
+        let devastatedResult = await appState.triggerEmotion("devastated")
+        XCTAssertTrue(devastatedResult.accepted)
+        XCTAssertEqual(appState.demoSessionInstance?.activeDemoEmotionName, "devastated")
+        XCTAssertEqual(appState.telemetry.robotState?.policy, "sit")
+        XCTAssertEqual(appState.telemetry.policies?.sitting, true)
+        XCTAssertEqual(appState.cockpitState, .sittingDown)
+
+        let reachedSeated = try await waitUntil(timeoutSeconds: 3.5) {
+            appState.cockpitState == .seated
+        }
+        XCTAssertTrue(reachedSeated, "Expected U6b Seated after devastated sit settle")
+        await appState.disconnect()
+
+        // Fresh seated session verifies yes plays cleanly while seated
+        let seatedAppState = AppState()
+        seatedAppState.startDemoMode(startWalking: true)
+        let slotGuardCleared = try await waitUntil(timeoutSeconds: 1.2) { !seatedAppState.slotGuardActive }
+        XCTAssertTrue(slotGuardCleared)
+
+        await seatedAppState.requestAction(.sit)
+        await seatedAppState.confirmDialogAction()
+        let isSeated = try await waitUntil(timeoutSeconds: 3.5) { seatedAppState.cockpitState == .seated }
+        XCTAssertTrue(isSeated)
+
+        let yesResult = await seatedAppState.triggerEmotion("yes")
+        XCTAssertTrue(yesResult.accepted)
+        XCTAssertEqual(seatedAppState.activeEmotionName, "yes")
+        XCTAssertEqual(seatedAppState.demoSessionInstance?.activeDemoEmotionName, "yes")
+        XCTAssertEqual(seatedAppState.telemetry.robotState?.policy, "sit")
+
+        let yesFinished = try await waitUntil(timeoutSeconds: 2.5) {
+            seatedAppState.demoSessionInstance?.activeDemoEmotionName == nil && seatedAppState.activeEmotionName == nil
+        }
+        XCTAssertTrue(yesFinished)
+        XCTAssertEqual(seatedAppState.cockpitState, .seated)
+
+        // Seated duck refuses kicks cleanly
+        let seatedKick = await seatedAppState.triggerKick(.left)
+        XCTAssertFalse(seatedKick.accepted)
+
+        await seatedAppState.disconnect()
+    }
+
+    func testDemoSessionKickPlays0_5sAndReturnsToWalking() async throws {
+        let demo = DemoRobotSession(startWalking: true)
+        demo.connect()
+
+        demo.setMove(vx: 0.2, vy: 0.0, vyaw: 0.3)
+        let rightResult = await demo.triggerKick(.right)
+        XCTAssertTrue(rightResult.accepted)
+        XCTAssertEqual(demo.activeDemoKickSide, .right)
+        XCTAssertEqual(demo.telemetry.robotState?.policy, "kick_right")
+        XCTAssertEqual(demo.telemetry.robotState?.movement.requested, [0, 0, 0])
+
+        let finished = try await waitUntil(timeoutSeconds: 1.5) {
+            demo.activeDemoKickSide == nil && demo.telemetry.robotState?.policy == "walk"
+        }
+        XCTAssertTrue(finished)
+
+        await demo.disconnect()
+    }
 }

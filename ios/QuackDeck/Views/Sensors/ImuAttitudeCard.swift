@@ -261,36 +261,45 @@ private struct ArtificialHorizonDial: View {
             context.drawLayer { layer in
                 layer.clip(to: circlePath)
 
-                let pitch = bodyAngles?.pitch ?? 0
-                let roll = bodyAngles?.roll ?? 0
-                let pitchShift = CGFloat(max(-35, min(35, pitch))) / 35.0 * (radius * 0.55)
+                if let bodyAngles {
+                    let pitchShift = CGFloat(max(-35, min(35, bodyAngles.pitch))) / 35.0 * (radius * 0.55)
 
-                layer.translateBy(x: center.x, y: center.y)
-                layer.rotate(by: .degrees(-roll))
+                    layer.translateBy(x: center.x, y: center.y)
+                    layer.rotate(by: .degrees(-bodyAngles.roll))
 
-                let groundRect = CGRect(
-                    x: -radius * 1.6,
-                    y: pitchShift,
-                    width: radius * 3.2,
-                    height: radius * 2.2
-                )
-                layer.fill(Path(groundRect), with: .color(QuackTheme.duckOrange.opacity(0.22)))
+                    let groundRect = CGRect(
+                        x: -radius * 1.6,
+                        y: pitchShift,
+                        width: radius * 3.2,
+                        height: radius * 2.2
+                    )
+                    layer.fill(Path(groundRect), with: .color(QuackTheme.duckOrange.opacity(0.22)))
 
-                var horizon = Path()
-                horizon.move(to: CGPoint(x: -radius * 1.4, y: pitchShift))
-                horizon.addLine(to: CGPoint(x: radius * 1.4, y: pitchShift))
-                layer.stroke(horizon, with: .color(QuackTheme.duckOrange), lineWidth: 2)
+                    var horizon = Path()
+                    horizon.move(to: CGPoint(x: -radius * 1.4, y: pitchShift))
+                    horizon.addLine(to: CGPoint(x: radius * 1.4, y: pitchShift))
+                    layer.stroke(horizon, with: .color(QuackTheme.duckOrange), lineWidth: 2)
 
-                if let head = headAngles {
-                    let headShift = CGFloat(max(-35, min(35, head.pitch))) / 35.0 * (radius * 0.55)
-                    layer.rotate(by: .degrees(roll - head.roll))
-                    var headLine = Path()
-                    headLine.move(to: CGPoint(x: -radius * 0.8, y: headShift))
-                    headLine.addLine(to: CGPoint(x: radius * 0.8, y: headShift))
+                    if let head = headAngles {
+                        let headShift = CGFloat(max(-35, min(35, head.pitch))) / 35.0 * (radius * 0.55)
+                        layer.rotate(by: .degrees(bodyAngles.roll - head.roll))
+                        var headLine = Path()
+                        headLine.move(to: CGPoint(x: -radius * 0.8, y: headShift))
+                        headLine.addLine(to: CGPoint(x: radius * 0.8, y: headShift))
+                        layer.stroke(
+                            headLine,
+                            with: .color(QuackTheme.acidCyan.opacity(0.75)),
+                            style: StrokeStyle(lineWidth: 1.5, dash: [4, 3])
+                        )
+                    }
+                } else {
+                    var dashed = Path()
+                    dashed.move(to: CGPoint(x: center.x - radius * 0.8, y: center.y))
+                    dashed.addLine(to: CGPoint(x: center.x + radius * 0.8, y: center.y))
                     layer.stroke(
-                        headLine,
-                        with: .color(QuackTheme.acidCyan.opacity(0.75)),
-                        style: StrokeStyle(lineWidth: 1.5, dash: [4, 3])
+                        dashed,
+                        with: .color(QuackTheme.creamText.opacity(0.28)),
+                        style: StrokeStyle(lineWidth: 1.5, dash: [4, 4])
                     )
                 }
             }

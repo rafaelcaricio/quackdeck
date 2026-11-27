@@ -3,12 +3,15 @@ import Security
 
 enum RobotVaultError: LocalizedError {
     case encodingFailed
+    case corruptIndex
     case keychainStatus(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .encodingFailed:
             return "Could not encode robot pairing key"
+        case .corruptIndex:
+            return "Saved ducks metadata could not be decoded; original backup preserved"
         case .keychainStatus(let status):
             if let message = SecCopyErrorMessageString(status, nil) as String? {
                 return "Keychain error: \(message) (\(status))"
@@ -23,6 +26,7 @@ final class RobotVault: @unchecked Sendable {
 
     private let keychainService: String
     private let defaultsKey: String
+    private let corruptBackupKey: String
     private let defaults: UserDefaults
     private let lock = NSLock()
 
@@ -33,13 +37,20 @@ final class RobotVault: @unchecked Sendable {
     ) {
         self.keychainService = keychainService
         self.defaultsKey = defaultsKey
+        self.corruptBackupKey = "\(defaultsKey).corruptBackup"
         self.defaults = defaults
+    }
+
+    var hasCorruptIndexBackup: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return defaults.data(forKey: corruptBackupKey) != nil
     }
 
     func loadPairedDucks() -> [PairedDuck] {
         lock.lock()
         defer { lock.unlock() }
-        return readIndexLocked()
+        return readIndexLocked().ducks
     }
 
     func pairedDuck(for robotId: String) -> PairedDuck? {
@@ -47,11 +58,17 @@ final class RobotVault: @unchecked Sendable {
     }
 
     func save(duck: PairedDuck, pskHex: String) throws {
-        try storeKeychainSecret(pskHex, account: duck.robotId)
-
         lock.lock()
         defer { lock.unlock() }
-        var list = readIndexLocked()
+
+        let read = readIndexLocked()
+        if read.decodeFailed && read.ducks.isEmpty {
+            throw RobotVaultError.corruptIndex
+        }
+
+        try storeKeychainSecret(pskHex, account: duck.robotId)
+
+        var list = read.ducks
         if let idx = list.firstIndex(where: { $0.robotId == duck.robotId }) {
             list[idx] = duck
         } else {
@@ -69,7 +86,11 @@ final class RobotVault: @unchecked Sendable {
     ) {
         lock.lock()
         defer { lock.unlock() }
-        var list = readIndexLocked()
+        let read = readIndexLocked()
+        if read.decodeFailed && read.ducks.isEmpty {
+            return
+        }
+        var list = read.ducks
         guard let idx = list.firstIndex(where: { $0.robotId == robotId }) else { return }
         if let name, !name.isEmpty {
             list[idx].name = name
@@ -87,6 +108,8 @@ final class RobotVault: @unchecked Sendable {
     }
 
     func pskHex(for robotId: String) throws -> String? {
+        lock.lock()
+        defer { lock.unlock() }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -109,6 +132,14 @@ final class RobotVault: @unchecked Sendable {
     }
 
     func remove(robotId: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let read = readIndexLocked()
+        if read.decodeFailed && read.ducks.isEmpty {
+            throw RobotVaultError.corruptIndex
+        }
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -119,9 +150,7 @@ final class RobotVault: @unchecked Sendable {
             throw RobotVaultError.keychainStatus(status)
         }
 
-        lock.lock()
-        defer { lock.unlock() }
-        var list = readIndexLocked()
+        var list = read.ducks
         list.removeAll { $0.robotId == robotId }
         writeIndexLocked(list)
     }
@@ -159,11 +188,31 @@ final class RobotVault: @unchecked Sendable {
         }
     }
 
-    private func readIndexLocked() -> [PairedDuck] {
+    private func readIndexLocked() -> (ducks: [PairedDuck], decodeFailed: Bool) {
         guard let data = defaults.data(forKey: defaultsKey) else {
-            return []
+            return ([], false)
         }
-        return (try? JSONDecoder().decode([PairedDuck].self, from: data)) ?? []
+        if let decoded = try? JSONDecoder().decode([PairedDuck].self, from: data) {
+            return (decoded, false)
+        }
+
+        if defaults.data(forKey: corruptBackupKey) == nil {
+            defaults.set(data, forKey: corruptBackupKey)
+        }
+
+        var recovered: [PairedDuck] = []
+        if let array = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+            let decoder = JSONDecoder()
+            for element in array {
+                guard JSONSerialization.isValidJSONObject(element),
+                      let itemData = try? JSONSerialization.data(withJSONObject: element, options: []),
+                      let duck = try? decoder.decode(PairedDuck.self, from: itemData) else {
+                    continue
+                }
+                recovered.append(duck)
+            }
+        }
+        return (recovered, true)
     }
 
     private func writeIndexLocked(_ ducks: [PairedDuck]) {

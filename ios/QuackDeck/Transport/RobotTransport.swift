@@ -1,6 +1,13 @@
 import Foundation
 import WebRTC
 
+enum ShutdownOutcome: Equatable, Sendable {
+    case none
+    case requested
+    case unconfirmedLostConnection
+    case confirmedPoweredOff
+}
+
 enum VideoFrameSource: Equatable {
     case none
     case demo
@@ -38,6 +45,12 @@ struct TelemetrySnapshot: Equatable, Sendable {
     var nextRetrySeconds: Int? = nil
     var isAutoReconnecting: Bool = false
     var isPoweredOff: Bool = false
+    var shutdownOutcome: ShutdownOutcome = .none
+    var lastRobotStateUptime: TimeInterval?
+    var lastHealthUptime: TimeInterval?
+    var isRobotStateStale: Bool = false
+    var isHealthStale: Bool = false
+    var isVideoFirstFrameTimedOut: Bool = false
 
     var hasSitstand: Bool {
         CockpitStateResolver.hasSitstand(policies: policies, subscribeAck: subscribeAck)
@@ -45,6 +58,18 @@ struct TelemetrySnapshot: Equatable, Sendable {
 
     var hasWalkPolicy: Bool {
         CockpitStateResolver.hasWalkPolicy(policies: policies, subscribeAck: subscribeAck)
+    }
+
+    var availableEmotions: [String] {
+        MicroduckEmotions.discover(subscribeAck: subscribeAck, policies: policies)
+    }
+
+    var availableKickSides: Set<KickSide> {
+        MicroduckKicks.discover(policies: policies, subscribeAck: subscribeAck)
+    }
+
+    var hasAnyKick: Bool {
+        !availableKickSides.isEmpty
     }
 
     var nearestTofMeters: Double? {
@@ -91,6 +116,8 @@ protocol RobotSessionTransport: AnyObject {
     func sendInit() async -> IntentResult
     func setPolicyEnabled(_ on: Bool) async -> IntentResult
     func sendSitToggle() async -> IntentResult
+    func triggerEmotion(_ name: String) async -> IntentResult
+    func triggerKick(_ side: KickSide) async -> IntentResult
     func sendRelax() async -> IntentResult
     func sendRest() async -> IntentResult
     func sendShutdown() async -> IntentResult

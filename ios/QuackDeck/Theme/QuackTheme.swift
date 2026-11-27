@@ -43,6 +43,8 @@ enum QuackIcon {
     static let ducks = "dot.radiowaves.left.and.right"
 
     static let lookCenter = "scope"
+    static let emotions = "face.smiling"
+    static let kick = "soccerball"
     static let turnLeft = "arrow.counterclockwise"
     static let turnRight = "arrow.clockwise"
     static let refresh = "arrow.clockwise"

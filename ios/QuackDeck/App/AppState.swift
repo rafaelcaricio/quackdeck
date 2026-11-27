@@ -8,6 +8,13 @@ enum ThermalAlertLevel: Equatable, Sendable {
     case hot
 }
 
+struct BoundCockpitConfirmation: Equatable {
+    let id: UUID
+    let sessionGeneration: UInt64
+    let robotId: String?
+    let confirmation: CockpitConfirmation
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -24,6 +31,7 @@ final class AppState {
     private(set) var pairedDucks: [PairedDuck] = []
     private(set) var lastConnectedDuck: PairedDuck?
     private(set) var isRetryingConnection: Bool = false
+    private(set) var connectingRobotId: String?
     private var liveSession: LiveRobotSession?
     private var demoSession: DemoRobotSession?
 
@@ -57,16 +65,38 @@ final class AppState {
     private(set) var inFlightAction: CockpitAction?
     private(set) var slotGuardActive: Bool = false
     private(set) var didConfirmSitThisSession: Bool = false
-    var pendingConfirmation: CockpitConfirmation?
+    private(set) var activeEmotionName: String?
+    private(set) var activeEmotionEndsAt: Date?
+    private(set) var activeEmotionDurationKnown: Bool = false
+    private(set) var emotionStatusNote: String?
+    private(set) var activeKickReservationSide: KickSide?
+    private(set) var pendingBoundConfirmation: BoundCockpitConfirmation?
+    var pendingConfirmation: CockpitConfirmation? {
+        get { pendingBoundConfirmation?.confirmation }
+        set {
+            if let newValue {
+                pendingBoundConfirmation = BoundCockpitConfirmation(
+                    id: UUID(),
+                    sessionGeneration: sessionSelectionGeneration,
+                    robotId: currentRobotId,
+                    confirmation: newValue
+                )
+            } else {
+                pendingBoundConfirmation = nil
+            }
+        }
+    }
 
-    // Continuous drive state kept at app level for instant scenePhase zeroing
+    // Continuous drive state kept at app level for instant scenePhase & navigation zeroing
     private(set) var stickForward: Double = 0
     private(set) var stickStrafeLeft: Double = 0
     private(set) var turnYawLeft: Double = 0
+    private(set) var inputResetGeneration: UInt64 = 0
 
     // Internal transition & timer tracking
     @ObservationIgnored private var lastObservedPolicy: String?
     @ObservationIgnored private var lastResolvedCockpitState: CockpitState = .offline
+    @ObservationIgnored private var lastResolvedLayoutCockpitState: CockpitState = .offline
     @ObservationIgnored private var inFlightStartState: CockpitState?
     @ObservationIgnored private var autoRiseSawDrivingPolicy: Bool = false
     @ObservationIgnored private var suppressNextPostHomingLatch: Bool = false
@@ -77,7 +107,13 @@ final class AppState {
     @ObservationIgnored private var shutdownPendingTask: Task<Void, Never>?
     @ObservationIgnored private var inFlightTask: Task<Void, Never>?
     @ObservationIgnored private var slotGuardTask: Task<Void, Never>?
-    @ObservationIgnored private var observationGeneration: UInt64 = 0
+    @ObservationIgnored private var activeEmotionTask: Task<Void, Never>?
+    @ObservationIgnored private var emotionNoteTask: Task<Void, Never>?
+    @ObservationIgnored private var kickDebounceTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingEmotionReservationName: String?
+    @ObservationIgnored private var actionSessionGeneration: UInt64 = 0
+    @ObservationIgnored private var activeActionReservationId: UUID?
+    @ObservationIgnored private var sessionSelectionGeneration: UInt64 = 0
     @ObservationIgnored private var retryAttemptGeneration: UInt64 = 0
 
     init(vault: RobotVault = .shared, defaults: UserDefaults = .standard) {
@@ -161,24 +197,78 @@ final class AppState {
         computeCockpitState()
     }
 
+    var layoutCockpitState: CockpitState {
+        cockpitState.layoutProjected(hasSitstand: telemetry.hasSitstand)
+    }
+
     var canDrive: Bool {
-        Self.canDrive(for: cockpitState)
+        !telemetry.isRobotStateStale && Self.canDrive(for: layoutCockpitState)
     }
 
     var canLook: Bool {
-        Self.canLook(for: cockpitState)
+        !telemetry.isRobotStateStale && Self.canLook(for: layoutCockpitState)
     }
 
     var canShowStop: Bool {
-        Self.canDrive(for: cockpitState)
+        !telemetry.isRobotStateStale && Self.canDrive(for: layoutCockpitState)
     }
 
     var canShowQuack: Bool {
-        Self.canLook(for: cockpitState)
+        !telemetry.isRobotStateStale && Self.canLook(for: layoutCockpitState)
+    }
+
+    var availableEmotions: [String] {
+        telemetry.availableEmotions
+    }
+
+    var availableKickSides: Set<KickSide> {
+        telemetry.availableKickSides
+    }
+
+    var displayedActiveKickSide: KickSide? {
+        cockpitState.runningKickSide ?? activeKickReservationSide
+    }
+
+    var isDrivingInputInhibited: Bool {
+        displayedActiveKickSide != nil || activeEmotionName != nil || pendingEmotionReservationName != nil
+    }
+
+    var canShowKicks: Bool {
+        !availableKickSides.isEmpty && canDrive
+    }
+
+    static func canTriggerEmotions(for state: CockpitState, availableEmotions: [String]) -> Bool {
+        guard !availableEmotions.isEmpty else { return false }
+        switch state {
+        case .walking, .seated:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var canTriggerEmotions: Bool {
+        !telemetry.isRobotStateStale && Self.canTriggerEmotions(for: cockpitState, availableEmotions: availableEmotions)
+    }
+
+    static func canTriggerKick(
+        _ side: KickSide,
+        for state: CockpitState,
+        availableKickSides: Set<KickSide>
+    ) -> Bool {
+        guard availableKickSides.contains(side) else { return false }
+        if case .walking = state { return true }
+        return false
+    }
+
+    func canTriggerKick(_ side: KickSide) -> Bool {
+        !telemetry.isRobotStateStale
+            && !isDrivingInputInhibited
+            && Self.canTriggerKick(side, for: cockpitState, availableKickSides: availableKickSides)
     }
 
     var isCompactUtilityRowVisible: Bool {
-        cockpitState == .seated
+        layoutCockpitState == .seated
     }
 
     var canSafeRest: Bool {
@@ -229,6 +319,12 @@ final class AppState {
     }
 
     var guidanceText: String? {
+        if phase.isConnected && telemetry.shutdownOutcome == .requested {
+            return telemetry.statusBanner ?? "Shutdown requested..."
+        }
+        if phase.isConnected && telemetry.isRobotStateStale {
+            return "Waiting for robot state..."
+        }
         switch cockpitState {
         case .offline:
             if !canForceRetry {
@@ -241,6 +337,9 @@ final class AppState {
                 return telemetry.isPoweredOff
                     ? "Reconnecting to \(currentDuckName)..."
                     : "Retrying connection to \(currentDuckName)..."
+            }
+            if telemetry.shutdownOutcome == .unconfirmedLostConnection && phase == .disconnected {
+                return "Connection lost · shutdown unconfirmed · Tap Reconnect"
             }
             if telemetry.isPoweredOff && phase == .disconnected {
                 return "\(currentDuckName) powered off · Turn it on, then tap Reconnect"
@@ -304,6 +403,9 @@ final class AppState {
         case .rising:
             return "Standing up... Stay ready to steady"
         case .runningSkill(let name):
+            if KickSide(rawValue: name) != nil {
+                return nil
+            }
             return "Running \(name)..."
         case .pickedUp:
             return "Picked up · Walking paused. Set down to resume, or Hold"
@@ -325,10 +427,16 @@ final class AppState {
     }
 
     var guidanceTone: GuidanceTone {
+        if phase.isConnected && (telemetry.isRobotStateStale || telemetry.shutdownOutcome == .requested) {
+            return .caution
+        }
         switch cockpitState {
         case .offline:
             guard canForceRetry else {
                 return phase == .configuringWifi ? .caution : .neutral
+            }
+            if telemetry.shutdownOutcome == .unconfirmedLostConnection && phase == .disconnected && !isRetryingConnection {
+                return .caution
             }
             if telemetry.isPoweredOff && phase == .disconnected && !isRetryingConnection {
                 return .neutral
@@ -458,14 +566,20 @@ final class AppState {
     }
 
     func startDemoMode(startWalking: Bool = false) {
+        sessionSelectionGeneration &+= 1
+        let selectionGen = sessionSelectionGeneration
+        connectingRobotId = nil
+
         if liveSession == nil && demoSession == nil {
             activateDemoSession(startWalking: startWalking)
             return
         }
-        Task { @MainActor in
-            await stopActiveLiveSessionIfAny()
-            await stopDemoModeIfAny()
-            activateDemoSession(startWalking: startWalking)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.stopActiveLiveSessionIfAny()
+            await self.stopDemoModeIfAny()
+            guard self.sessionSelectionGeneration == selectionGen else { return }
+            self.activateDemoSession(startWalking: startWalking)
         }
     }
 
@@ -478,7 +592,6 @@ final class AppState {
         demo.connect()
         self.demoSession = demo
         self.isDucksSheetPresented = false
-        self.armSessionObservation()
         self.reconcileCockpitState()
         QuackHaptics.success()
     }
@@ -486,85 +599,142 @@ final class AppState {
     @discardableResult
     func pairAndConnect(setupCodeRaw: String, peripheralId: UUID? = nil) async throws -> PairedDuck {
         let parsed = try QuackDeckCore.parseSetupCode(setupCodeRaw)
-        let targetPeripheralId = peripheralId
-            ?? vault.pairedDuck(for: parsed.robotId)?.peripheralId
-            ?? bleManager.discoveredDucks.first(where: { $0.isConnectable })?.id
-
         let existing = vault.pairedDuck(for: parsed.robotId)
-        let duckName = bleManager.discoveredDucks.first(where: { $0.id == targetPeripheralId })?.name
+
+        let targetPeripheralId: UUID?
+        if let peripheralId {
+            targetPeripheralId = peripheralId
+        } else if let savedPid = existing?.peripheralId {
+            targetPeripheralId = savedPid
+        } else {
+            let connectable = bleManager.discoveredDucks.filter(\.isConnectable)
+            if connectable.count > 1 {
+                throw BleManagerError.disconnected("Multiple nearby ducks found. Pick the specific Bluetooth duck in Ducks.")
+            }
+            targetPeripheralId = connectable.first?.id
+        }
+
+        let matchedDiscovered = bleManager.discoveredDucks.first(where: { $0.id == targetPeripheralId })
+        let duckName = matchedDiscovered?.name
             ?? existing?.name
             ?? parsed.robotId
 
-        let duck = PairedDuck(
+        let candidateDuck = PairedDuck(
             robotId: parsed.robotId,
             name: duckName,
-            lastIp: bleManager.discoveredDucks.first(where: { $0.id == targetPeripheralId })?.advInfo.ipv4 ?? existing?.lastIp,
+            lastIp: matchedDiscovered?.advInfo.ipv4 ?? existing?.lastIp,
             peripheralId: targetPeripheralId,
             pairedAt: existing?.pairedAt ?? Date(),
             lastConnectedAt: existing?.lastConnectedAt
         )
-        try vault.save(duck: duck, pskHex: parsed.pskHex)
-        reloadPairedDucks()
 
-        await connectToPairedDuck(duck)
-        if case .error(let detail) = liveSession?.phase {
-            throw BleManagerError.disconnected(liveSession?.telemetry.lastError ?? detail)
+        let outcomeSession = await connectDuckSession(candidateDuck, pskHex: parsed.pskHex)
+        guard let outcomeSession else {
+            throw BleManagerError.disconnected("Connection was superseded by another duck selection.")
         }
-        return vault.pairedDuck(for: parsed.robotId) ?? duck
+        if outcomeSession.phase.isConnected || outcomeSession.phase == .configuringWifi {
+            let savedDuck = PairedDuck(
+                robotId: parsed.robotId,
+                name: outcomeSession.currentDuckName.isEmpty ? duckName : outcomeSession.currentDuckName,
+                lastIp: outcomeSession.currentIpAddress ?? candidateDuck.lastIp,
+                peripheralId: targetPeripheralId,
+                pairedAt: existing?.pairedAt ?? Date(),
+                lastConnectedAt: Date()
+            )
+            try vault.save(duck: savedDuck, pskHex: parsed.pskHex)
+            lastConnectedDuck = savedDuck
+            reloadPairedDucks()
+            return savedDuck
+        }
+        if case .error(let detail) = outcomeSession.phase {
+            throw BleManagerError.disconnected(outcomeSession.telemetry.lastError ?? detail)
+        }
+        throw BleManagerError.disconnected(outcomeSession.telemetry.lastError ?? "Could not authenticate with duck.")
     }
 
     func connectToPairedDuck(_ duck: PairedDuck) async {
-        await stopDemoModeIfAny()
-        await liveSession?.disconnect()
-        resetCockpitLatches()
-        lastConnectedDuck = duck
-
-        let session = LiveRobotSession(bleManager: bleManager, vault: vault)
-        session.onStateUpdated = { [weak self] in
-            self?.reconcileCockpitState()
-        }
-        liveSession = session
-        armSessionObservation()
-
         do {
             guard let pskHex = try vault.pskHex(for: duck.robotId) else {
                 activeAlertMessage = "No setup key found for \(duck.name). Pair again with the setup code."
                 return
             }
-            await session.connectToPairedDuck(duck, pskHex: pskHex)
-            reloadPairedDucks()
-            reconcileCockpitState()
+            _ = await connectDuckSession(duck, pskHex: pskHex)
         } catch {
             activeAlertMessage = error.localizedDescription
             reconcileCockpitState()
         }
     }
 
+    @discardableResult
+    private func connectDuckSession(_ duck: PairedDuck, pskHex: String) async -> LiveRobotSession? {
+        sessionSelectionGeneration &+= 1
+        let selectionGen = sessionSelectionGeneration
+        connectingRobotId = duck.robotId
+        stopAllMotion()
+
+        await stopDemoModeIfAny()
+        await stopActiveLiveSessionIfAny()
+
+        guard sessionSelectionGeneration == selectionGen else {
+            return nil
+        }
+
+        resetCockpitLatches()
+        lastConnectedDuck = duck
+
+        let session = LiveRobotSession(bleManager: bleManager, vault: vault)
+        session.onStateUpdated = { [weak self, weak session] in
+            guard let self, self.liveSession === session else { return }
+            self.reconcileCockpitState()
+        }
+        liveSession = session
+
+        await session.connectToPairedDuck(duck, pskHex: pskHex)
+        guard sessionSelectionGeneration == selectionGen, liveSession === session else {
+            return nil
+        }
+        if connectingRobotId == duck.robotId {
+            connectingRobotId = nil
+        }
+        reloadPairedDucks()
+        reconcileCockpitState()
+        return session
+    }
+
     func connectViaBle(peripheralId: UUID, setupCodeRaw: String) async throws {
         let parsed = try QuackDeckCore.parseSetupCode(setupCodeRaw)
+        sessionSelectionGeneration &+= 1
+        let selectionGen = sessionSelectionGeneration
+        connectingRobotId = parsed.robotId
+        stopAllMotion()
+
         await stopDemoModeIfAny()
-        await liveSession?.disconnect()
+        await stopActiveLiveSessionIfAny()
+
+        guard sessionSelectionGeneration == selectionGen else {
+            throw BleManagerError.disconnected("Connection was superseded by another duck selection.")
+        }
+
         resetCockpitLatches()
 
+        let existing = vault.pairedDuck(for: parsed.robotId)
         let discoveredName = bleManager.discoveredDucks.first(where: { $0.id == peripheralId })?.name
         let duck = PairedDuck(
             robotId: parsed.robotId,
-            name: discoveredName ?? parsed.robotId,
-            lastIp: bleManager.discoveredDucks.first(where: { $0.id == peripheralId })?.advInfo.ipv4,
+            name: discoveredName ?? existing?.name ?? parsed.robotId,
+            lastIp: bleManager.discoveredDucks.first(where: { $0.id == peripheralId })?.advInfo.ipv4 ?? existing?.lastIp,
             peripheralId: peripheralId,
-            pairedAt: vault.pairedDuck(for: parsed.robotId)?.pairedAt ?? Date(),
-            lastConnectedAt: nil
+            pairedAt: existing?.pairedAt ?? Date(),
+            lastConnectedAt: existing?.lastConnectedAt
         )
-        try vault.save(duck: duck, pskHex: parsed.pskHex)
         lastConnectedDuck = duck
-        reloadPairedDucks()
 
         let session = LiveRobotSession(bleManager: bleManager, vault: vault)
-        session.onStateUpdated = { [weak self] in
-            self?.reconcileCockpitState()
+        session.onStateUpdated = { [weak self, weak session] in
+            guard let self, self.liveSession === session else { return }
+            self.reconcileCockpitState()
         }
         liveSession = session
-        armSessionObservation()
 
         await session.connectViaBle(
             peripheralId: peripheralId,
@@ -572,6 +742,26 @@ final class AppState {
             pskHex: parsed.pskHex,
             fallbackName: discoveredName
         )
+
+        guard sessionSelectionGeneration == selectionGen, liveSession === session else {
+            throw BleManagerError.disconnected("Connection was superseded by another duck selection.")
+        }
+        if connectingRobotId == parsed.robotId {
+            connectingRobotId = nil
+        }
+
+        if session.phase.isConnected || session.phase == .configuringWifi {
+            let savedDuck = PairedDuck(
+                robotId: parsed.robotId,
+                name: session.currentDuckName.isEmpty ? duck.name : session.currentDuckName,
+                lastIp: session.currentIpAddress ?? duck.lastIp,
+                peripheralId: peripheralId,
+                pairedAt: existing?.pairedAt ?? Date(),
+                lastConnectedAt: Date()
+            )
+            try vault.save(duck: savedDuck, pskHex: parsed.pskHex)
+            lastConnectedDuck = savedDuck
+        }
         reloadPairedDucks()
         reconcileCockpitState()
         if case .error(let detail) = session.phase {
@@ -638,18 +828,13 @@ final class AppState {
     }
 
     func disconnect() async {
+        sessionSelectionGeneration &+= 1
+        let selectionGen = sessionSelectionGeneration
+        connectingRobotId = nil
         stopAllMotion()
-        observationGeneration &+= 1
-        if let demo = demoSession {
-            demo.onStateUpdated = nil
-            await demo.disconnect()
-            demoSession = nil
-        }
-        if let live = liveSession {
-            live.onStateUpdated = nil
-            await live.disconnect()
-            liveSession = nil
-        }
+        await stopDemoModeIfAny()
+        await stopActiveLiveSessionIfAny()
+        guard sessionSelectionGeneration == selectionGen else { return }
         resetCockpitLatches()
         reconcileCockpitState()
     }
@@ -692,7 +877,7 @@ final class AppState {
     /// Updates virtual drive thumbstick in normalized `[-1, 1]` axes:
     /// `forward > 0` moves forward (`+vx`), `strafeLeft > 0` strafes left (`+vy`).
     func updateDriveStick(forward: Double, strafeLeft: Double) {
-        if !canDrive {
+        if !canDrive || isDrivingInputInhibited {
             if stickForward != 0 || stickStrafeLeft != 0 {
                 stickForward = 0
                 stickStrafeLeft = 0
@@ -707,7 +892,7 @@ final class AppState {
 
     /// Updates turn rocker in normalized `[-1, 1]` (`yawLeft > 0` turns left `+vyaw`).
     func updateTurnRocker(yawLeft: Double) {
-        if !canDrive {
+        if !canDrive || isDrivingInputInhibited {
             if turnYawLeft != 0 {
                 turnYawLeft = 0
                 pushCombinedMove()
@@ -719,7 +904,7 @@ final class AppState {
     }
 
     func setLook(y: Double, z: Double) {
-        guard canLook else { return }
+        guard canLook, !isDrivingInputInhibited else { return }
         activeSession?.setLook(y: y, z: z)
     }
 
@@ -729,27 +914,28 @@ final class AppState {
     }
 
     func lookCenter() {
-        guard canLook else { return }
+        guard canLook, !isDrivingInputInhibited else { return }
         QuackHaptics.light()
         activeSession?.lookCenter()
     }
 
     func isActionBlockedBySlotGuard(_ action: CockpitAction) -> Bool {
         guard slotGuardActive else { return false }
+        let layout = layoutCockpitState
         switch action {
         case .stopMoving:
             return false
         case .relax:
             // Protect against tapping Relax right after tapping Init in U2 -> U3; never guard safety states.
-            return cockpitState == .initializing
+            return layout == .initializing
         case .shutdown:
             // Protect against tapping Shut Down right after Relax transitions into U2 Limp.
-            if case .limp = cockpitState {
+            if case .limp = layout {
                 return true
             }
             return false
         case .sit, .hold:
-            if case .walking = cockpitState {
+            if case .walking = layout {
                 return true
             }
             return false
@@ -826,16 +1012,35 @@ final class AppState {
         }
     }
 
-    func confirmDialogAction() async {
-        guard let confirmation = pendingConfirmation else { return }
-        await confirm(confirmation)
+    func confirmDialogAction(bound: BoundCockpitConfirmation? = nil) async {
+        let token = bound ?? pendingBoundConfirmation
+        guard let token else { return }
+        await confirmBound(token)
     }
 
     func confirm(_ confirmation: CockpitConfirmation) async {
-        pendingConfirmation = nil
-        guard isConfirmationValidForCurrentState(confirmation) else { return }
+        if let bound = pendingBoundConfirmation, bound.confirmation == confirmation {
+            await confirmBound(bound)
+            return
+        }
+        let synthetic = BoundCockpitConfirmation(
+            id: UUID(),
+            sessionGeneration: sessionSelectionGeneration,
+            robotId: currentRobotId,
+            confirmation: confirmation
+        )
+        await confirmBound(synthetic)
+    }
 
-        switch confirmation {
+    private func confirmBound(_ bound: BoundCockpitConfirmation) async {
+        if pendingBoundConfirmation?.id == bound.id {
+            pendingBoundConfirmation = nil
+        } else {
+            pendingBoundConfirmation = nil
+        }
+        guard isBoundConfirmationValid(bound) else { return }
+
+        switch bound.confirmation {
         case .initMotors:
             await dispatchAction(.initMotors)
         case .startWalk:
@@ -852,6 +1057,14 @@ final class AppState {
         }
     }
 
+    private func isBoundConfirmationValid(_ bound: BoundCockpitConfirmation) -> Bool {
+        guard bound.sessionGeneration == sessionSelectionGeneration,
+              bound.robotId == currentRobotId else {
+            return false
+        }
+        return isConfirmationValidForCurrentState(bound.confirmation)
+    }
+
     private func isConfirmationValidForCurrentState(_ confirmation: CockpitConfirmation) -> Bool {
         switch confirmation {
         case .initMotors:
@@ -862,7 +1075,7 @@ final class AppState {
         case .standFromHeldSeat:
             return cockpitState == .readySeated(hasPolicy: true)
         case .sitExperimental:
-            return cockpitState == .walking(hasSitstand: true)
+            return layoutCockpitState == .walking(hasSitstand: true)
         case .relaxDirect, .relaxOrShutdown, .relaxOrRest:
             switch cockpitState {
             case .offline, .syncing, .limp:
@@ -877,14 +1090,21 @@ final class AppState {
         }
     }
 
-    func confirmRelaxNow() async {
-        pendingConfirmation = nil
+    func confirmRelaxNow(bound: BoundCockpitConfirmation? = nil) async {
+        let token = bound ?? pendingBoundConfirmation
+        pendingBoundConfirmation = nil
+        if let token {
+            guard isBoundConfirmationValid(token) else { return }
+        } else {
+            guard isConfirmationValidForCurrentState(.relaxDirect) else { return }
+        }
         await dispatchAction(.relax)
     }
 
-    func confirmRestAndRelax() async {
-        let isStillSafe = canSafeRest
-        pendingConfirmation = nil
+    func confirmRestAndRelax(bound: BoundCockpitConfirmation? = nil) async {
+        let token = bound ?? pendingBoundConfirmation
+        let isStillSafe = canSafeRest && (token.map { isBoundConfirmationValid($0) } ?? true)
+        pendingBoundConfirmation = nil
         guard isStillSafe else {
             QuackHaptics.warning()
             activeAlertMessage = "Safe rest is no longer available in the current robot state."
@@ -894,14 +1114,12 @@ final class AppState {
     }
 
     func cancelPendingConfirmation() {
-        pendingConfirmation = nil
+        pendingBoundConfirmation = nil
     }
 
     func emergencyStop() async {
         QuackHaptics.heavy()
-        stickForward = 0
-        stickStrafeLeft = 0
-        turnYawLeft = 0
+        stopAllMotion()
         await activeSession?.emergencyStop()
     }
 
@@ -911,7 +1129,99 @@ final class AppState {
         await activeSession?.playQuack()
     }
 
+    @discardableResult
+    func triggerKick(_ side: KickSide) async -> IntentResult {
+        guard canShowKicks, availableKickSides.contains(side), let session = activeSession else {
+            return IntentResult(accepted: false, reason: "Kick is unavailable in the current robot state.")
+        }
+        if isDrivingInputInhibited {
+            if let currentEmotion = activeEmotionName {
+                showEmotionStatusNote("\(MicroduckEmotions.displayLabel(for: currentEmotion)) is still playing")
+            } else if let currentKick = displayedActiveKickSide {
+                showEmotionStatusNote("\(currentKick.activeBannerText)...")
+            } else {
+                showEmotionStatusNote("Another action is starting")
+            }
+            return IntentResult(accepted: false, reason: "Another action is already playing.")
+        }
+
+        // Reserve synchronously on MainActor before awaiting transport.
+        let reservationId = UUID()
+        let generation = actionSessionGeneration
+        activeActionReservationId = reservationId
+        activeKickReservationSide = side
+        stopAllMotion()
+        QuackHaptics.light()
+
+        let result = await session.triggerKick(side)
+        reconcileCockpitState()
+
+        guard actionSessionGeneration == generation, activeActionReservationId == reservationId else {
+            return result
+        }
+        activeActionReservationId = nil
+
+        if result.accepted {
+            startKickDebounceTimer()
+        } else {
+            clearKickReservation()
+            QuackHaptics.error()
+            activeAlertMessage = result.reason ?? "The robot refused \(side.fullLabel)."
+        }
+        return result
+    }
+
+    @discardableResult
+    func triggerEmotion(_ name: String) async -> IntentResult {
+        guard canTriggerEmotions, availableEmotions.contains(name), let session = activeSession else {
+            return IntentResult(accepted: false, reason: "Emotions are unavailable in the current robot state.")
+        }
+        if isDrivingInputInhibited {
+            if let current = activeEmotionName {
+                showEmotionStatusNote("\(MicroduckEmotions.displayLabel(for: current)) is still playing")
+            } else if let kickSide = displayedActiveKickSide {
+                showEmotionStatusNote("\(kickSide.activeBannerText)...")
+            } else {
+                showEmotionStatusNote("Another action is starting")
+            }
+            return IntentResult(accepted: false, reason: "Another action is already playing.")
+        }
+
+        // Reserve synchronously on MainActor before awaiting transport.
+        let reservationId = UUID()
+        let generation = actionSessionGeneration
+        activeActionReservationId = reservationId
+        pendingEmotionReservationName = name
+        stopAllMotion()
+        QuackHaptics.light()
+
+        let result = await session.triggerEmotion(name)
+        reconcileCockpitState()
+
+        guard actionSessionGeneration == generation, activeActionReservationId == reservationId else {
+            return result
+        }
+        activeActionReservationId = nil
+        pendingEmotionReservationName = nil
+
+        if result.accepted {
+            if Self.allowsActiveEmotion(for: cockpitState) {
+                let knownDuration = MicroduckEmotions.knownDurationSeconds(for: name)
+                startActiveEmotionTimer(
+                    name: name,
+                    duration: knownDuration ?? 2.5,
+                    durationKnown: knownDuration != nil
+                )
+            }
+        } else {
+            QuackHaptics.error()
+            activeAlertMessage = result.reason ?? "The robot refused that emotion."
+        }
+        return result
+    }
+
     func stopAllMotion() {
+        inputResetGeneration &+= 1
         stickForward = 0
         stickStrafeLeft = 0
         turnYawLeft = 0
@@ -997,33 +1307,47 @@ final class AppState {
         }
 
         let resolved = computeCockpitState()
+        let layoutResolved = resolved.layoutProjected(hasSitstand: telemetry.hasSitstand)
+        let stale = telemetry.isRobotStateStale
+
+        if !Self.allowsActiveKick(for: resolved) {
+            clearKickReservation()
+        }
+
         if resolved != lastResolvedCockpitState {
-            let previous = lastResolvedCockpitState
             lastResolvedCockpitState = resolved
 
-            pendingConfirmation = nil
+            if !Self.allowsActiveEmotion(for: resolved) {
+                clearActiveEmotion()
+                clearEmotionStatusNote()
+            }
+        }
 
-            if let startState = inFlightStartState, resolved != startState {
+        if layoutResolved != lastResolvedLayoutCockpitState {
+            let previousLayout = lastResolvedLayoutCockpitState
+            lastResolvedLayoutCockpitState = layoutResolved
+
+            pendingBoundConfirmation = nil
+
+            if let startState = inFlightStartState, layoutResolved != startState {
                 clearInFlightAction()
             }
 
-            if !Self.canDrive(for: resolved) && (stickForward != 0 || stickStrafeLeft != 0 || turnYawLeft != 0) {
-                stickForward = 0
-                stickStrafeLeft = 0
-                turnYawLeft = 0
-                activeSession?.setMove(vx: 0, vy: 0, vyaw: 0)
-            }
-            if !Self.canLook(for: resolved) {
-                stopLook()
-            }
-
-            if resolved.isSafetyOrFaultState || resolved == .offline || resolved == .syncing {
+            if layoutResolved.isSafetyOrFaultState || layoutResolved == .offline || layoutResolved == .syncing {
                 clearSlotGuard()
-            } else if shouldArmSlotGuard(from: previous, to: resolved) {
+            } else if shouldArmSlotGuard(from: previousLayout, to: layoutResolved) {
                 armSlotGuard()
             }
 
-            emitTransitionHaptic(from: previous, to: resolved)
+            emitTransitionHaptic(from: previousLayout, to: layoutResolved)
+        }
+
+        if (!Self.canDrive(for: layoutResolved) || stale || isDrivingInputInhibited)
+            && (stickForward != 0 || stickStrafeLeft != 0 || turnYawLeft != 0) {
+            stopAllMotion()
+        }
+        if !Self.canLook(for: layoutResolved) || stale {
+            stopLook()
         }
     }
 
@@ -1051,6 +1375,21 @@ final class AppState {
     private static func canLook(for state: CockpitState) -> Bool {
         switch state {
         case .walking, .seated:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func allowsActiveKick(for state: CockpitState) -> Bool {
+        if state.isRunningKick { return true }
+        if case .walking = state { return true }
+        return false
+    }
+
+    private static func allowsActiveEmotion(for state: CockpitState) -> Bool {
+        switch state {
+        case .walking, .sittingDown, .seated:
             return true
         default:
             return false
@@ -1315,7 +1654,70 @@ final class AppState {
         isShutdownPending = false
     }
 
+    private func startKickDebounceTimer() {
+        kickDebounceTask?.cancel()
+        let generation = actionSessionGeneration
+        kickDebounceTask = Task { @MainActor [weak self] in
+            let ns = UInt64(MicroduckKicks.durationSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            guard let self, !Task.isCancelled, self.actionSessionGeneration == generation else { return }
+            self.activeKickReservationSide = nil
+            self.kickDebounceTask = nil
+        }
+    }
+
+    private func clearKickReservation() {
+        kickDebounceTask?.cancel()
+        kickDebounceTask = nil
+        activeKickReservationSide = nil
+    }
+
+    private func startActiveEmotionTimer(name: String, duration: TimeInterval, durationKnown: Bool) {
+        activeEmotionTask?.cancel()
+        activeEmotionName = name
+        activeEmotionDurationKnown = durationKnown
+        activeEmotionEndsAt = Date().addingTimeInterval(duration)
+        let durationNs = UInt64(max(0.1, duration) * 1_000_000_000)
+        activeEmotionTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: durationNs)
+            guard let self, !Task.isCancelled else { return }
+            self.activeEmotionName = nil
+            self.activeEmotionDurationKnown = false
+            self.activeEmotionEndsAt = nil
+            self.activeEmotionTask = nil
+        }
+    }
+
+    private func clearActiveEmotion() {
+        activeEmotionTask?.cancel()
+        activeEmotionTask = nil
+        activeEmotionName = nil
+        activeEmotionDurationKnown = false
+        activeEmotionEndsAt = nil
+    }
+
+    private func showEmotionStatusNote(_ note: String) {
+        emotionNoteTask?.cancel()
+        emotionStatusNote = note
+        emotionNoteTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.emotionStatusNote = nil
+            self.emotionNoteTask = nil
+        }
+    }
+
+    private func clearEmotionStatusNote() {
+        emotionNoteTask?.cancel()
+        emotionNoteTask = nil
+        emotionStatusNote = nil
+    }
+
     private func resetCockpitLatches() {
+        actionSessionGeneration &+= 1
+        activeActionReservationId = nil
+        pendingEmotionReservationName = nil
+        clearKickReservation()
         clearPostHomingLatch()
         clearSitSettling()
         clearAutoRising()
@@ -1323,10 +1725,12 @@ final class AppState {
         clearShutdownPending()
         clearInFlightAction()
         clearSlotGuard()
+        clearActiveEmotion()
+        clearEmotionStatusNote()
         disarmedWhileFallen = false
         suppressNextPostHomingLatch = false
         lastObservedPolicy = nil
-        pendingConfirmation = nil
+        pendingBoundConfirmation = nil
         if !phase.isConnected {
             didConfirmSitThisSession = false
         }
@@ -1352,30 +1756,6 @@ final class AppState {
 
         default:
             break
-        }
-    }
-
-    private func armSessionObservation() {
-        observationGeneration &+= 1
-        let generation = observationGeneration
-        observeActiveSession(generation: generation)
-    }
-
-    private func observeActiveSession(generation: UInt64) {
-        guard generation == observationGeneration, let session = activeSession else { return }
-        withObservationTracking {
-            _ = session.phase
-            _ = session.telemetry.health
-            _ = session.telemetry.policies
-            _ = session.telemetry.subscribeAck
-            _ = session.telemetry.robotState
-            _ = session.telemetry.isPoweredOff
-        } onChange: { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, generation == self.observationGeneration else { return }
-                self.reconcileCockpitState()
-                self.observeActiveSession(generation: generation)
-            }
         }
     }
 

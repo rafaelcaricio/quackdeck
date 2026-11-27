@@ -1130,4 +1130,235 @@ final class CockpitStateTests: XCTestCase {
         )
         XCTAssertEqual(afterForgettingAlpha.map(\.id), [matchUuid.id, newNamedDuck.id])
     }
+
+    func testCanTriggerEmotionsAcrossAllCockpitStates() {
+        let allStates: [CockpitState] = [
+            .offline,
+            .syncing,
+            .hardwareBlocked(reason: "fault", homed: false),
+            .hardwareBlocked(reason: "fault", homed: true),
+            .limp(fallen: false),
+            .limp(fallen: true),
+            .initializing,
+            .calibratingImu(frozen: false),
+            .calibratingImu(frozen: true),
+            .readyHome(hasPolicy: true),
+            .readyHome(hasPolicy: false),
+            .readySeated(hasPolicy: true),
+            .readySeated(hasPolicy: false),
+            .walking(hasSitstand: true),
+            .walking(hasSitstand: false),
+            .sittingDown,
+            .seated,
+            .rising,
+            .runningSkill(name: "ground_pick"),
+            .pickedUp,
+            .fallenRecovering,
+            .fallenParked(disarmed: false),
+            .fallenParked(disarmed: true),
+            .resting(homed: true),
+            .resting(homed: false),
+            .shuttingDown(homed: true),
+            .shuttingDown(homed: false)
+        ]
+
+        let emotions = ["curious", "yes"]
+        for state in allStates {
+            let expected: Bool
+            switch state {
+            case .walking, .seated:
+                expected = true
+            default:
+                expected = false
+            }
+            XCTAssertEqual(
+                AppState.canTriggerEmotions(for: state, availableEmotions: emotions),
+                expected,
+                "Unexpected canTriggerEmotions for \(state) with non-empty emotions"
+            )
+            XCTAssertFalse(
+                AppState.canTriggerEmotions(for: state, availableEmotions: []),
+                "canTriggerEmotions must be false when availableEmotions is empty for \(state)"
+            )
+        }
+    }
+
+    func testTriggerEmotionGatingBusyNoteAndStateTransitionClearing() async throws {
+        let appState = AppState()
+
+        // Disconnected state rejects emotion triggering
+        XCTAssertFalse(appState.canTriggerEmotions)
+        let offlineResult = await appState.triggerEmotion("curious")
+        XCTAssertFalse(offlineResult.accepted)
+        XCTAssertNil(appState.activeEmotionName)
+
+        // U2 Limp rejects emotion triggering
+        appState.startDemoMode()
+        XCTAssertEqual(appState.cockpitState, .limp(fallen: false))
+        XCTAssertFalse(appState.canTriggerEmotions)
+        let limpResult = await appState.triggerEmotion("curious")
+        XCTAssertFalse(limpResult.accepted)
+        await appState.disconnect()
+
+        // U5 Walking accepts emotion, zeroes stick, and drops overlapping requests with status note
+        appState.startDemoMode(startWalking: true)
+        XCTAssertEqual(appState.cockpitState, .walking(hasSitstand: true))
+        XCTAssertEqual(appState.availableEmotions, MicroduckEmotions.defaultShippedNames)
+        XCTAssertTrue(appState.canTriggerEmotions)
+
+        let unknownResult = await appState.triggerEmotion("unknown_emotion")
+        XCTAssertFalse(unknownResult.accepted)
+        XCTAssertNil(appState.activeEmotionName)
+
+        appState.updateDriveStick(forward: 0.7, strafeLeft: 0.3)
+        let curiousResult = await appState.triggerEmotion("curious")
+        XCTAssertTrue(curiousResult.accepted)
+        XCTAssertEqual(appState.stickForward, 0)
+        XCTAssertEqual(appState.stickStrafeLeft, 0)
+        XCTAssertEqual(appState.activeEmotionName, "curious")
+
+        let overlapResult = await appState.triggerEmotion("yes")
+        XCTAssertFalse(overlapResult.accepted)
+        XCTAssertEqual(appState.activeEmotionName, "curious")
+        XCTAssertEqual(appState.emotionStatusNote, "Curious is still playing")
+
+        // Transition to .pickedUp clears active emotion and status note
+        appState.demoSessionInstance?.simulatePickedUp(true)
+        appState.reconcileCockpitState()
+        XCTAssertEqual(appState.cockpitState, .pickedUp)
+        XCTAssertNil(appState.activeEmotionName)
+        XCTAssertNil(appState.emotionStatusNote)
+
+        // Transition to .fallenRecovering clears active emotion and status note
+        await appState.disconnect()
+        appState.startDemoMode(startWalking: true)
+        _ = await appState.triggerEmotion("curious")
+        _ = await appState.triggerEmotion("yes")
+        XCTAssertEqual(appState.activeEmotionName, "curious")
+        XCTAssertNotNil(appState.emotionStatusNote)
+
+        appState.demoSessionInstance?.simulateFallen(true, recovering: true)
+        appState.reconcileCockpitState()
+        XCTAssertEqual(appState.cockpitState, .fallenRecovering)
+        XCTAssertNil(appState.activeEmotionName)
+        XCTAssertNil(appState.emotionStatusNote)
+
+        // Transition to .readyHome (Hold) clears active emotion and status note
+        await appState.disconnect()
+        appState.startDemoMode(startWalking: true)
+        _ = await appState.triggerEmotion("curious")
+        _ = await appState.triggerEmotion("yes")
+        let guardClearedForHold = try await waitUntil(timeoutSeconds: 1.2) { !appState.slotGuardActive }
+        XCTAssertTrue(guardClearedForHold)
+        await appState.requestAction(.hold)
+        XCTAssertEqual(appState.cockpitState, .readyHome(hasPolicy: true))
+        XCTAssertNil(appState.activeEmotionName)
+        XCTAssertNil(appState.emotionStatusNote)
+
+        // Transition to .limp (Relax) clears active emotion and status note
+        await appState.requestAction(.walk)
+        await appState.confirmDialogAction()
+        XCTAssertEqual(appState.cockpitState, .walking(hasSitstand: true))
+        _ = await appState.triggerEmotion("curious")
+        _ = await appState.triggerEmotion("yes")
+        await appState.confirmRelaxNow()
+        XCTAssertEqual(appState.cockpitState, .limp(fallen: false))
+        XCTAssertNil(appState.activeEmotionName)
+        XCTAssertNil(appState.emotionStatusNote)
+
+        // devastated preserves active emotion across U5 -> U6a Sitting Down -> U6b Seated
+        await appState.disconnect()
+        appState.startDemoMode(startWalking: true)
+        let devastatedResult = await appState.triggerEmotion("devastated")
+        XCTAssertTrue(devastatedResult.accepted)
+        XCTAssertEqual(appState.cockpitState, .sittingDown)
+        XCTAssertEqual(appState.activeEmotionName, "devastated")
+
+        let reachedSeated = try await waitUntil(timeoutSeconds: 3.5) {
+            appState.cockpitState == .seated
+        }
+        XCTAssertTrue(reachedSeated, "Expected U6b Seated during devastated, got \(appState.cockpitState)")
+        XCTAssertEqual(appState.activeEmotionName, "devastated")
+
+        // Older daemon with no emotions disables emotion triggering
+        appState.demoSessionInstance?.simulateEmotions([])
+        appState.reconcileCockpitState()
+        XCTAssertEqual(appState.availableEmotions, [])
+        XCTAssertFalse(appState.canTriggerEmotions)
+        let emptyResult = await appState.triggerEmotion("yes")
+        XCTAssertFalse(emptyResult.accepted)
+
+        await appState.disconnect()
+    }
+
+    func testKickProjectionInhibitionAndP0SafetyGuards() async throws {
+        let appState = AppState()
+        appState.startDemoMode(startWalking: true)
+
+        XCTAssertTrue(appState.canShowKicks)
+        XCTAssertTrue(appState.canTriggerKick(.left))
+        XCTAssertTrue(appState.canTriggerKick(.right))
+
+        let resetBefore = appState.inputResetGeneration
+        appState.updateDriveStick(forward: 0.7, strafeLeft: 0.2)
+        appState.updateTurnRocker(yawLeft: 1.0)
+
+        let kickResult = await appState.triggerKick(.left)
+        XCTAssertTrue(kickResult.accepted)
+        XCTAssertGreaterThan(appState.inputResetGeneration, resetBefore)
+        XCTAssertEqual(appState.stickForward, 0)
+        XCTAssertEqual(appState.stickStrafeLeft, 0)
+        XCTAssertEqual(appState.turnYawLeft, 0)
+
+        // Layout projects kick onto walking so STOP/stick/posture stay mounted without jitter
+        XCTAssertEqual(appState.cockpitState, .runningSkill(name: "kick_left"))
+        XCTAssertEqual(appState.layoutCockpitState, .walking(hasSitstand: true))
+        XCTAssertEqual(appState.displayedActiveKickSide, .left)
+        XCTAssertTrue(appState.isDrivingInputInhibited)
+        XCTAssertTrue(appState.canDrive)
+        XCTAssertTrue(appState.canShowStop)
+
+        // Stick/turn inputs are suppressed while kicking
+        appState.updateDriveStick(forward: 0.8, strafeLeft: 0.0)
+        XCTAssertEqual(appState.stickForward, 0)
+
+        // Overlapping kick or emotion is rejected cleanly while kicking
+        let overlapKick = await appState.triggerKick(.right)
+        XCTAssertFalse(overlapKick.accepted)
+        let overlapEmo = await appState.triggerEmotion("yes")
+        XCTAssertFalse(overlapEmo.accepted)
+
+        // Wait for 0.5 s kick to finish cleanly
+        let finished = try await waitUntil(timeoutSeconds: 1.5) {
+            appState.cockpitState == .walking(hasSitstand: true) && !appState.isDrivingInputInhibited
+        }
+        XCTAssertTrue(finished)
+        XCTAssertNil(appState.displayedActiveKickSide)
+
+        // Single-foot and zero-foot policy states
+        appState.demoSessionInstance?.simulateKickSides([.right])
+        appState.reconcileCockpitState()
+        XCTAssertEqual(appState.availableKickSides, [.right])
+        XCTAssertFalse(appState.canTriggerKick(.left))
+        XCTAssertTrue(appState.canTriggerKick(.right))
+
+        appState.demoSessionInstance?.simulateKickSides([])
+        appState.reconcileCockpitState()
+        XCTAssertFalse(appState.canShowKicks)
+
+        // P0 #4: Stale BoundCockpitConfirmation from an earlier session does not execute after session change
+        await appState.requestAction(.relax)
+        let staleBound = appState.pendingBoundConfirmation
+        XCTAssertNotNil(staleBound)
+
+        await appState.disconnect()
+        appState.startDemoMode(startWalking: true)
+        let resetDuringRetry = appState.cockpitState
+        XCTAssertEqual(resetDuringRetry, .walking(hasSitstand: true))
+
+        await appState.confirmRelaxNow(bound: staleBound)
+        XCTAssertEqual(appState.cockpitState, .walking(hasSitstand: true), "Stale confirmation from earlier session must be ignored")
+
+        await appState.disconnect()
+    }
 }
