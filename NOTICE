@@ -1,0 +1,57 @@
+QuackDeck
+Copyright 2026 Rafael Caricio
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Pollen Robotics Attribution & Upstream Crates
+================================================================================
+
+QuackDeck links against and interoperates with upstream Microduck protocol
+crates created by Pollen Robotics (https://github.com/pollen-robotics/microduck):
+
+  - duck-auth
+  - duck-ble
+  - duck-ipc-proto
+
+These upstream crates are Copyright Pollen Robotics and are licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+QuackDeck's BLE advertisement wrapper (rust/quackdeck-core/src/adv.rs) also
+normalizes 9-byte Apple-joined CoreBluetooth manufacturer payloads emitted by
+boards with BlueZ device privacy disabled before forwarding them to duck-ble.
+
+QuackDeck's wire data models (ios/QuackDeck/Bridge/ProtoModels.swift) and state
+machine documentation (docs/robot-state-machine.md) implement interoperability
+with Pollen Robotics' Microduck JSON-RPC protocol. QuackDeck's dark cockpit
+palette also draws visual inspiration from Pollen Robotics' microduck-simulator
+(https://huggingface.co/spaces/pollen-robotics/microduck-simulator).
+
+Pollen Robotics' 3D CAD / STL model files in pollen-robotics/microduck_rl
+(separately licensed under CC BY-NC-SA 4.0) and Pollen Robotics logos or brand
+assets are NOT included in QuackDeck.
+
+================================================================================
+Trademark & Non-Affiliation Notice
+================================================================================
+
+QuackDeck is an independent, unofficial open-source project and is not
+affiliated with, endorsed by, or sponsored by Pollen Robotics.
+
+"Pollen Robotics" and "Microduck" are names and/or trademarks of Pollen
+Robotics. In accordance with Section 6 of the Apache License, Version 2.0,
+these names are used solely for reasonable and customary identification of
+protocol compatibility and upstream crate origin.
+
+================================================================================
+Other Third-Party Components
+================================================================================
+
+Compiled builds of QuackDeck also include third-party open-source software
+under permissive licenses, including:
+
+  - WebRTC (stasel/WebRTC & Google WebRTC) — BSD 3-Clause License
+    (see LICENSES/WebRTC-BSD-3-Clause.txt)
+  - Rust dependencies linked into quackdeck-core (MIT, Apache-2.0,
+    BSD-3-Clause, BSD-2-Clause, ISC, and Unlicense)
+
+See THIRD_PARTY_NOTICES.md for full third-party attribution and license texts.

@@ -1,0 +1,21 @@
+[package]
+name = "quackdeck-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Core Microduck BLE, Noise, and LAN gateway transport for QuackDeck iOS"
+
+[lib]
+name = "quackdeck_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+base64 = "0.22"
+duck-auth = { git = "https://github.com/pollen-robotics/microduck.git", tag = "daemon-v0.23.0" }
+duck-ble = { git = "https://github.com/pollen-robotics/microduck.git", tag = "daemon-v0.23.0" }
+duck-ipc-proto = { git = "https://github.com/pollen-robotics/microduck.git", tag = "daemon-v0.23.0" }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.26"

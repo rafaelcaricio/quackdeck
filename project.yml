@@ -1,0 +1,71 @@
+name: QuackDeck
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    from: 130.0.0
+
+targets:
+  QuackDeck:
+    type: application
+    platform: iOS
+    configFiles:
+      Debug: ios/Signing.xcconfig
+      Release: ios/Signing.xcconfig
+    sources:
+      - path: ios/QuackDeck
+      - path: LICENSE
+        buildPhase: resources
+      - path: NOTICE
+        buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+      - path: LICENSES/WebRTC-BSD-3-Clause.txt
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(QUACKDECK_BUNDLE_IDENTIFIER)
+        PRODUCT_NAME: QuackDeck
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.10"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: ios/QuackDeck/Info.plist
+        ENABLE_BITCODE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    dependencies:
+      - package: WebRTC
+      - framework: ios/Frameworks/QuackDeckCore.xcframework
+        embed: false
+      - sdk: CoreBluetooth.framework
+      - sdk: AVFoundation.framework
+      - sdk: Security.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+
+  QuackDeckTests:
+    type: bundle.unit-test
+    platform: iOS
+    configFiles:
+      Debug: ios/Signing.xcconfig
+      Release: ios/Signing.xcconfig
+    sources:
+      - path: ios/QuackDeckTests
+        optional: true
+    dependencies:
+      - target: QuackDeck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(QUACKDECK_BUNDLE_IDENTIFIER).tests
+        SWIFT_VERSION: "5.10"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        GENERATE_INFOPLIST_FILE: YES
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64

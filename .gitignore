@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Xcode & SwiftPM build outputs
+.build/
+DerivedData/
+QuackDeck.xcodeproj/
+*.xcuserdatad/
+
+# Rust build outputs & prebuilt XCFramework
+rust/target/
+ios/Frameworks/QuackDeckCore.xcframework/
+
+# Machine-local overrides (signing, cargo patches, local agent rules)
+ios/Local.xcconfig
+rust/.cargo/config.toml
+.agents/rules/local.md
+AGENTS.local.md

@@ -1,0 +1,9 @@
+// Shared iOS signing configuration for QuackDeck.
+// To sign for a physical device locally, create a gitignored ios/Local.xcconfig file:
+//
+//   DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID
+//   QUACKDECK_BUNDLE_IDENTIFIER = com.example.quackdeck
+//
+CODE_SIGN_STYLE = Automatic
+QUACKDECK_BUNDLE_IDENTIFIER = com.caricio.quackdeck
+#include? "Local.xcconfig"

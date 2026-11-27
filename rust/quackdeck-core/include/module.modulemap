@@ -1,0 +1,4 @@
+module QuackDeckCoreFFI {
+    header "quackdeck_core.h"
+    export *
+}
