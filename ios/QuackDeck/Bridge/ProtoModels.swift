@@ -1262,6 +1262,77 @@ struct MediaVideoInfo: Codable, Sendable, Equatable {
     }
 }
 
+struct VolumeResult: Codable, Sendable, Equatable {
+    let volume: UInt8
+    let applies: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case volume
+        case applies
+    }
+
+    init(volume: UInt8, applies: Bool = true) {
+        self.volume = min(100, volume)
+        self.applies = applies
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawVolume = try container.decodeIfPresent(UInt8.self, forKey: .volume) ?? 100
+        volume = min(100, rawVolume)
+        applies = try container.decodeIfPresent(Bool.self, forKey: .applies) ?? true
+    }
+}
+
+enum RobotVolumeStatus: Equatable, Sendable {
+    case unknown
+    case loading
+    case loaded(VolumeResult)
+    case unsupported
+    case failed(String)
+
+    var currentVolume: VolumeResult? {
+        if case .loaded(let result) = self {
+            return result
+        }
+        return nil
+    }
+}
+
+struct DuckPreferences: Codable, Sendable, Equatable, Hashable {
+    static let defaultMaxLinearSpeed: Double = 0.30
+    static let maxLinearSpeedRange: ClosedRange<Double> = 0.05...0.30
+    static let maxLinearSpeedStep: Double = 0.05
+    static let speedPresets: [Double] = [0.10, 0.15, 0.20, 0.30]
+
+    var maxLinearSpeed: Double
+
+    enum CodingKeys: String, CodingKey {
+        case maxLinearSpeed
+    }
+
+    init(maxLinearSpeed: Double = DuckPreferences.defaultMaxLinearSpeed) {
+        self.maxLinearSpeed = Self.clampLinearSpeed(maxLinearSpeed)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try container.decodeIfPresent(Double.self, forKey: .maxLinearSpeed)
+            ?? Self.defaultMaxLinearSpeed
+        maxLinearSpeed = Self.clampLinearSpeed(raw)
+    }
+
+    static func clampLinearSpeed(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultMaxLinearSpeed }
+        let clamped = min(maxLinearSpeedRange.upperBound, max(maxLinearSpeedRange.lowerBound, value))
+        return (clamped * 100.0).rounded() / 100.0
+    }
+
+    var isCustomSpeedLimit: Bool {
+        abs(maxLinearSpeed - Self.defaultMaxLinearSpeed) > 0.001
+    }
+}
+
 // MARK: - App & Discovery Models
 
 struct DiscoveredDuck: Identifiable, Sendable, Equatable {
@@ -1282,8 +1353,19 @@ struct PairedDuck: Codable, Identifiable, Sendable, Equatable {
     var peripheralId: UUID?
     let pairedAt: Date
     var lastConnectedAt: Date?
+    var preferences: DuckPreferences
 
     var id: String { robotId }
+
+    enum CodingKeys: String, CodingKey {
+        case robotId
+        case name
+        case lastIp
+        case peripheralId
+        case pairedAt
+        case lastConnectedAt
+        case preferences
+    }
 
     init(
         robotId: String,
@@ -1291,7 +1373,8 @@ struct PairedDuck: Codable, Identifiable, Sendable, Equatable {
         lastIp: String? = nil,
         peripheralId: UUID? = nil,
         pairedAt: Date = Date(),
-        lastConnectedAt: Date? = nil
+        lastConnectedAt: Date? = nil,
+        preferences: DuckPreferences = DuckPreferences()
     ) {
         self.robotId = robotId
         self.name = name
@@ -1299,6 +1382,19 @@ struct PairedDuck: Codable, Identifiable, Sendable, Equatable {
         self.peripheralId = peripheralId
         self.pairedAt = pairedAt
         self.lastConnectedAt = lastConnectedAt
+        self.preferences = preferences
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        robotId = try container.decode(String.self, forKey: .robotId)
+        name = try container.decode(String.self, forKey: .name)
+        lastIp = try container.decodeIfPresent(String.self, forKey: .lastIp)
+        peripheralId = try container.decodeIfPresent(UUID.self, forKey: .peripheralId)
+        pairedAt = try container.decode(Date.self, forKey: .pairedAt)
+        lastConnectedAt = try container.decodeIfPresent(Date.self, forKey: .lastConnectedAt)
+        preferences = try container.decodeIfPresent(DuckPreferences.self, forKey: .preferences)
+            ?? DuckPreferences()
     }
 }
 

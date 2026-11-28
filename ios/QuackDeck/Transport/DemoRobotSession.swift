@@ -97,6 +97,9 @@ final class DemoRobotSession: RobotSessionTransport {
     private var motorMaxTempC: Double = 44.2
     private var simWifiSsid: String? = "HomeWiFi"
     private var simJoining: Joining?
+    private var simVolume: UInt8 = 75
+    private var simVolumeApplies: Bool = true
+    private var simVolumeSupported: Bool = true
 
     init(startWalking: Bool = false) {
         self.startWalkingOnConnect = startWalking
@@ -131,6 +134,9 @@ final class DemoRobotSession: RobotSessionTransport {
         telemetry.nextRetrySeconds = nil
         telemetry.isAutoReconnecting = false
         telemetry.isPoweredOff = false
+        telemetry.volumeStatus = simVolumeSupported
+            ? .loaded(VolumeResult(volume: simVolume, applies: simVolumeApplies))
+            : .unsupported
 
         telemetry.systemInfo = SystemInfoResult(
             name: "Microduck (Demo)",
@@ -531,12 +537,61 @@ final class DemoRobotSession: RobotSessionTransport {
         publishImmediateWireSnapshot()
     }
 
+    func simulateVolumeSupport(supported: Bool, applies: Bool = true, volume: UInt8? = nil) {
+        simVolumeSupported = supported
+        simVolumeApplies = applies
+        if let volume {
+            simVolume = min(100, volume)
+        }
+        telemetry.volumeStatus = supported
+            ? .loaded(VolumeResult(volume: simVolume, applies: simVolumeApplies))
+            : .unsupported
+        onStateUpdated?()
+    }
+
     func playQuack() async {
         lastQuackAt = Date()
         telemetry.statusBanner = "Quack!"
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             if self?.telemetry.statusBanner == "Quack!" {
+                self?.telemetry.statusBanner = nil
+            }
+        }
+    }
+
+    func refreshVolume() async {
+        guard phase.isConnected else { return }
+        telemetry.volumeStatus = simVolumeSupported
+            ? .loaded(VolumeResult(volume: simVolume, applies: simVolumeApplies))
+            : .unsupported
+        onStateUpdated?()
+    }
+
+    func setSpeakerVolume(_ volume: UInt8) async throws -> VolumeResult {
+        guard phase.isConnected else {
+            throw BleManagerError.disconnected("Connect to a duck first.")
+        }
+        guard simVolumeSupported else {
+            telemetry.volumeStatus = .unsupported
+            onStateUpdated?()
+            throw BleManagerError.rpcError(code: -32601, message: "Method not found: robot.setVolume")
+        }
+        simVolume = min(100, volume)
+        let result = VolumeResult(volume: simVolume, applies: simVolumeApplies)
+        telemetry.volumeStatus = .loaded(result)
+        onStateUpdated?()
+        return result
+    }
+
+    func playTestQuack() async {
+        guard phase.isConnected else { return }
+        lastQuackAt = Date()
+        let banner = simVolume == 0 ? "Quack! (Muted)" : "Quack! (\(simVolume)%)"
+        telemetry.statusBanner = banner
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if self?.telemetry.statusBanner == banner {
                 self?.telemetry.statusBanner = nil
             }
         }

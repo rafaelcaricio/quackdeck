@@ -519,4 +519,44 @@ final class ProtoModelsTests: XCTestCase {
         XCTAssertLessThan(fit90.imageRect.width, 375)
         XCTAssertGreaterThan(fit90.imageRect.minX, 0)
     }
+
+    func testDuckPreferencesClampingAndLegacyPairedDuckDecode() throws {
+        XCTAssertEqual(DuckPreferences().maxLinearSpeed, 0.30, accuracy: 0.0001)
+        XCTAssertFalse(DuckPreferences().isCustomSpeedLimit)
+
+        XCTAssertEqual(DuckPreferences(maxLinearSpeed: 0.01).maxLinearSpeed, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(DuckPreferences(maxLinearSpeed: 0.15).maxLinearSpeed, 0.15, accuracy: 0.0001)
+        XCTAssertTrue(DuckPreferences(maxLinearSpeed: 0.15).isCustomSpeedLimit)
+        XCTAssertEqual(DuckPreferences(maxLinearSpeed: 0.90).maxLinearSpeed, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(DuckPreferences(maxLinearSpeed: .nan).maxLinearSpeed, 0.30, accuracy: 0.0001)
+
+        // Legacy PairedDuck JSON without `preferences` must decode cleanly to default 0.30 m/s
+        let legacyJSON = """
+        {
+          "robotId": "duck-legacy",
+          "name": "Legacy Duck",
+          "lastIp": "192.168.1.50",
+          "pairedAt": 1000
+        }
+        """
+        let decodedLegacy = try decoder.decode(PairedDuck.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decodedLegacy.robotId, "duck-legacy")
+        XCTAssertEqual(decodedLegacy.preferences.maxLinearSpeed, 0.30, accuracy: 0.0001)
+    }
+
+    func testVolumeResultDecodeAndClamping() throws {
+        let json = """
+        { "volume": 65, "applies": true }
+        """
+        let decoded = try decoder.decode(VolumeResult.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.volume, 65)
+        XCTAssertTrue(decoded.applies)
+
+        let overMaxJSON = """
+        { "volume": 150, "applies": false }
+        """
+        let clamped = try decoder.decode(VolumeResult.self, from: Data(overMaxJSON.utf8))
+        XCTAssertEqual(clamped.volume, 100)
+        XCTAssertFalse(clamped.applies)
+    }
 }

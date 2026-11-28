@@ -51,6 +51,7 @@ struct TelemetrySnapshot: Equatable, Sendable {
     var isRobotStateStale: Bool = false
     var isHealthStale: Bool = false
     var isVideoFirstFrameTimedOut: Bool = false
+    var volumeStatus: RobotVolumeStatus = .unknown
 
     var hasSitstand: Bool {
         CockpitStateResolver.hasSitstand(policies: policies, subscribeAck: subscribeAck)
@@ -124,6 +125,9 @@ protocol RobotSessionTransport: AnyObject {
     func refreshPolicies() async
     func emergencyStop() async
     func playQuack() async
+    func refreshVolume() async
+    func setSpeakerVolume(_ volume: UInt8) async throws -> VolumeResult
+    func playTestQuack() async
     func scanWifiNetworks() async throws -> [WifiNetwork]
     func connectWifi(ssid: String, psk: String?) async throws -> ConnectResult
     func forgetWifi(ssid: String) async throws -> Bool

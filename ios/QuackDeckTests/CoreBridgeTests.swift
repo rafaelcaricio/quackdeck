@@ -134,4 +134,45 @@ final class CoreBridgeTests: XCTestCase {
             )
         )
     }
+
+    func testRobotVaultPersistsPerDuckPreferencesAcrossMetadataAndReconnectSaves() throws {
+        let suiteName = "quackdeck.prefVaultTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let defaultsKey = "pairedDucks.\(UUID().uuidString)"
+        let keychainService = "com.caricio.quackdeck.prefVaultTests.\(UUID().uuidString)"
+        let vault = RobotVault(
+            keychainService: keychainService,
+            defaultsKey: defaultsKey,
+            defaults: defaults
+        )
+        let psk = String(repeating: "cd", count: 32)
+        defer {
+            try? vault.remove(robotId: "duck-a")
+            try? vault.remove(robotId: "duck-b")
+        }
+
+        try vault.save(duck: PairedDuck(robotId: "duck-a", name: "Phoebe"), pskHex: psk)
+        try vault.save(duck: PairedDuck(robotId: "duck-b", name: "Daisy"), pskHex: psk)
+
+        vault.updatePreferences(robotId: "duck-a", preferences: DuckPreferences(maxLinearSpeed: 0.15))
+        vault.updatePreferences(robotId: "duck-b", preferences: DuckPreferences(maxLinearSpeed: 0.20))
+
+        XCTAssertEqual(vault.pairedDuck(for: "duck-a")?.preferences.maxLinearSpeed ?? 0, 0.15, accuracy: 0.0001)
+        XCTAssertEqual(vault.pairedDuck(for: "duck-b")?.preferences.maxLinearSpeed ?? 0, 0.20, accuracy: 0.0001)
+
+        // Updating connection metadata must preserve per-duck preferences
+        vault.updateConnectionMetadata(robotId: "duck-a", lastIp: "192.168.1.170", connectedAt: Date())
+        XCTAssertEqual(vault.pairedDuck(for: "duck-a")?.preferences.maxLinearSpeed ?? 0, 0.15, accuracy: 0.0001)
+
+        // Re-saving with preserved preferences keeps distinct caps isolated
+        if var existingA = vault.pairedDuck(for: "duck-a") {
+            existingA.name = "Phoebe Renamed"
+            try vault.save(duck: existingA, pskHex: psk)
+        }
+        XCTAssertEqual(vault.pairedDuck(for: "duck-a")?.name, "Phoebe Renamed")
+        XCTAssertEqual(vault.pairedDuck(for: "duck-a")?.preferences.maxLinearSpeed ?? 0, 0.15, accuracy: 0.0001)
+        XCTAssertEqual(vault.pairedDuck(for: "duck-b")?.preferences.maxLinearSpeed ?? 0, 0.20, accuracy: 0.0001)
+    }
 }

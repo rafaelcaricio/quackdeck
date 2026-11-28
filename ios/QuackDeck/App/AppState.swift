@@ -34,6 +34,7 @@ final class AppState {
     private(set) var connectingRobotId: String?
     private var liveSession: LiveRobotSession?
     private var demoSession: DemoRobotSession?
+    private(set) var demoPreferences = DuckPreferences()
 
     var isDucksSheetPresented: Bool = false
     var activeAlertMessage: String?
@@ -115,6 +116,7 @@ final class AppState {
     @ObservationIgnored private var activeActionReservationId: UUID?
     @ObservationIgnored private var sessionSelectionGeneration: UInt64 = 0
     @ObservationIgnored private var retryAttemptGeneration: UInt64 = 0
+    @ObservationIgnored private var volumeRequestSeq: UInt64 = 0
 
     init(vault: RobotVault = .shared, defaults: UserDefaults = .standard) {
         self.vault = vault
@@ -152,6 +154,36 @@ final class AppState {
 
     var isConnected: Bool {
         phase.isConnected
+    }
+
+    var isActiveSessionReachableForSettings: Bool {
+        phase.isConnected || phase == .configuringWifi
+    }
+
+    func preferences(for robotId: String) -> DuckPreferences {
+        if isDemoMode, robotId == demoSession?.currentRobotId {
+            return demoPreferences
+        }
+        return pairedDucks.first(where: { $0.robotId == robotId })?.preferences
+            ?? vault.pairedDuck(for: robotId)?.preferences
+            ?? DuckPreferences()
+    }
+
+    var activeDuckPreferences: DuckPreferences {
+        if isDemoMode {
+            return demoPreferences
+        }
+        if let robotId = currentRobotId {
+            return preferences(for: robotId)
+        }
+        if let duck = lastConnectedDuck {
+            return duck.preferences
+        }
+        return DuckPreferences()
+    }
+
+    var activeMaxLinearSpeed: Double {
+        activeDuckPreferences.maxLinearSpeed
     }
 
     var isDemoMode: Bool {
@@ -585,6 +617,7 @@ final class AppState {
 
     private func activateDemoSession(startWalking: Bool) {
         resetCockpitLatches()
+        demoPreferences = DuckPreferences()
         let demo = DemoRobotSession(startWalking: startWalking)
         demo.onStateUpdated = { [weak self] in
             self?.reconcileCockpitState()
@@ -625,7 +658,8 @@ final class AppState {
             lastIp: matchedDiscovered?.advInfo.ipv4 ?? existing?.lastIp,
             peripheralId: targetPeripheralId,
             pairedAt: existing?.pairedAt ?? Date(),
-            lastConnectedAt: existing?.lastConnectedAt
+            lastConnectedAt: existing?.lastConnectedAt,
+            preferences: existing?.preferences ?? DuckPreferences()
         )
 
         let outcomeSession = await connectDuckSession(candidateDuck, pskHex: parsed.pskHex)
@@ -639,7 +673,8 @@ final class AppState {
                 lastIp: outcomeSession.currentIpAddress ?? candidateDuck.lastIp,
                 peripheralId: targetPeripheralId,
                 pairedAt: existing?.pairedAt ?? Date(),
-                lastConnectedAt: Date()
+                lastConnectedAt: Date(),
+                preferences: existing?.preferences ?? DuckPreferences()
             )
             try vault.save(duck: savedDuck, pskHex: parsed.pskHex)
             lastConnectedDuck = savedDuck
@@ -725,7 +760,8 @@ final class AppState {
             lastIp: bleManager.discoveredDucks.first(where: { $0.id == peripheralId })?.advInfo.ipv4 ?? existing?.lastIp,
             peripheralId: peripheralId,
             pairedAt: existing?.pairedAt ?? Date(),
-            lastConnectedAt: existing?.lastConnectedAt
+            lastConnectedAt: existing?.lastConnectedAt,
+            preferences: existing?.preferences ?? DuckPreferences()
         )
         lastConnectedDuck = duck
 
@@ -757,7 +793,8 @@ final class AppState {
                 lastIp: session.currentIpAddress ?? duck.lastIp,
                 peripheralId: peripheralId,
                 pairedAt: existing?.pairedAt ?? Date(),
-                lastConnectedAt: Date()
+                lastConnectedAt: Date(),
+                preferences: existing?.preferences ?? DuckPreferences()
             )
             try vault.save(duck: savedDuck, pskHex: parsed.pskHex)
             lastConnectedDuck = savedDuck
@@ -866,6 +903,57 @@ final class AppState {
 
     func refreshNetStatus() async {
         await activeSession?.refreshNetStatus()
+    }
+
+    // MARK: - Per-Robot Preferences & Speaker Volume
+
+    func updateMaxLinearSpeed(_ speed: Double, for robotId: String) {
+        let clamped = DuckPreferences.clampLinearSpeed(speed)
+        if isDemoMode, robotId == demoSession?.currentRobotId {
+            demoPreferences.maxLinearSpeed = clamped
+        } else {
+            vault.updatePreferences(robotId: robotId, preferences: DuckPreferences(maxLinearSpeed: clamped))
+            reloadPairedDucks()
+        }
+        if robotId == currentRobotId && (stickForward != 0 || stickStrafeLeft != 0) {
+            pushCombinedMove()
+        }
+    }
+
+    func resetPreferences(for robotId: String) {
+        updateMaxLinearSpeed(DuckPreferences.defaultMaxLinearSpeed, for: robotId)
+    }
+
+    func refreshSpeakerVolume() async {
+        guard isActiveSessionReachableForSettings, let session = activeSession else { return }
+        await session.refreshVolume()
+    }
+
+    @discardableResult
+    func setSpeakerVolume(_ volume: UInt8) async throws -> VolumeResult {
+        guard isActiveSessionReachableForSettings, let session = activeSession else {
+            throw BleManagerError.disconnected("Connect to a duck first.")
+        }
+        volumeRequestSeq &+= 1
+        let seq = volumeRequestSeq
+        do {
+            let result = try await session.setSpeakerVolume(volume)
+            guard volumeRequestSeq == seq else {
+                throw CancellationError()
+            }
+            return result
+        } catch {
+            guard volumeRequestSeq == seq else {
+                throw CancellationError()
+            }
+            throw error
+        }
+    }
+
+    func playTestQuack() async {
+        guard isActiveSessionReachableForSettings, let session = activeSession else { return }
+        QuackHaptics.light()
+        await session.playTestQuack()
     }
 
     // MARK: - Controls & Safety
@@ -1762,8 +1850,9 @@ final class AppState {
     // MARK: - Private helpers
 
     private func pushCombinedMove() {
-        let vx = stickForward * LiveRobotSession.maxLinearSpeed
-        let vy = stickStrafeLeft * LiveRobotSession.maxLinearSpeed
+        let maxLinear = activeMaxLinearSpeed
+        let vx = stickForward * maxLinear
+        let vy = stickStrafeLeft * maxLinear
         let vyaw = turnYawLeft * LiveRobotSession.maxAngularSpeed
         activeSession?.setMove(vx: vx, vy: vy, vyaw: vyaw)
     }

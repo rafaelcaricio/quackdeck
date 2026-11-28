@@ -5,6 +5,7 @@ struct DucksSheetView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var setupTarget: SetupTarget?
+    @State private var settingsTarget: DuckSettingsTarget?
     @State private var showWifiSetup: Bool = false
     @State private var showLicenses: Bool = false
     @State private var duckPendingForget: PairedDuck?
@@ -97,6 +98,9 @@ struct DucksSheetView: View {
             .navigationDestination(isPresented: $showLicenses) {
                 LicensesView()
             }
+            .navigationDestination(item: $settingsTarget) { target in
+                DuckSettingsView(appState: appState, target: target)
+            }
             .alert("Forget Duck?", isPresented: Binding(
                 get: { duckPendingForget != nil },
                 set: { if !$0 { duckPendingForget = nil } }
@@ -129,7 +133,7 @@ struct DucksSheetView: View {
                 appState.startBleScan()
             }
             .onDisappear {
-                if setupTarget == nil && !showWifiSetup && !showLicenses {
+                if setupTarget == nil && settingsTarget == nil && !showWifiSetup && !showLicenses {
                     appState.stopBleScan()
                 }
             }
@@ -172,6 +176,54 @@ struct DucksSheetView: View {
                     }
 
                     Spacer()
+
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(String(format: "%.2f m/s", appState.activeMaxLinearSpeed))
+                            .font(QuackTheme.monoValue(size: 11, weight: .semibold))
+                            .foregroundStyle(QuackTheme.duckOrange)
+                        if let vol = session.telemetry.volumeStatus.currentVolume {
+                            Text("Vol \(vol.volume)%")
+                                .font(QuackTheme.monoValue(size: 11, weight: .semibold))
+                                .foregroundStyle(QuackTheme.acidCyan)
+                        }
+                    }
+                }
+
+                if let activeRobotId = session.currentRobotId ?? appState.lastConnectedDuck?.robotId {
+                    let speedSummary = String(format: "%.2f m/s", appState.activeMaxLinearSpeed)
+                    let volumeSummary = session.telemetry.volumeStatus.currentVolume.map { " · \($0.volume)%" } ?? ""
+
+                    Button {
+                        QuackHaptics.light()
+                        settingsTarget = .paired(robotId: activeRobotId)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: QuackIcon.settings)
+                                .font(.system(size: 15, weight: .semibold))
+                            Text("Duck Settings")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Text("\(speedSummary)\(volumeSummary)")
+                                .font(QuackTheme.monoValue(size: 12, weight: .medium))
+                                .foregroundStyle(QuackTheme.duckOrange.opacity(0.9))
+                            Image(systemName: QuackIcon.chevronRight)
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(QuackTheme.duckOrange)
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: QuackTheme.secondaryButtonHeight)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(QuackTheme.duckOrange.opacity(0.16))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .strokeBorder(QuackTheme.duckOrange.opacity(0.35), lineWidth: 1)
+                                )
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.quackTouch)
                 }
 
                 if session.telemetry.isAutoReconnecting {
@@ -274,32 +326,71 @@ struct DucksSheetView: View {
     }
 
     private var demoModeCard: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Offline Demo Mode")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(QuackTheme.creamText)
-                Text("Simulate video, ToF, IMUs, and joints without hardware")
-                    .font(.caption)
-                    .foregroundStyle(QuackTheme.creamText.opacity(0.6))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Offline Demo Mode")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(QuackTheme.creamText)
+                    Text("Simulate video, ToF, IMUs, and joints without hardware")
+                        .font(.caption)
+                        .foregroundStyle(QuackTheme.creamText.opacity(0.6))
+                }
+
+                Spacer(minLength: 8)
+
+                Toggle("", isOn: Binding(
+                    get: { appState.isDemoMode },
+                    set: { enabled in
+                        if enabled {
+                            appState.stopBleScan()
+                            appState.startDemoMode()
+                            dismiss()
+                        } else {
+                            Task { await appState.disconnect() }
+                        }
+                    }
+                ))
+                .labelsHidden()
+                .tint(QuackTheme.duckOrange)
             }
 
-            Spacer(minLength: 8)
+            if appState.isDemoMode {
+                let speedSummary = String(format: "%.2f m/s", appState.activeMaxLinearSpeed)
+                let volumeSummary = appState.telemetry.volumeStatus.currentVolume.map { " · \($0.volume)%" } ?? ""
 
-            Toggle("", isOn: Binding(
-                get: { appState.isDemoMode },
-                set: { enabled in
-                    if enabled {
-                        appState.stopBleScan()
-                        appState.startDemoMode()
-                        dismiss()
-                    } else {
-                        Task { await appState.disconnect() }
+                Button {
+                    QuackHaptics.light()
+                    settingsTarget = .demo
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: QuackIcon.settings)
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("Demo Settings")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(speedSummary)\(volumeSummary)")
+                            .font(QuackTheme.monoValue(size: 12, weight: .medium))
+                            .foregroundStyle(QuackTheme.duckOrange.opacity(0.9))
+                        Image(systemName: QuackIcon.chevronRight)
+                            .font(.system(size: 12, weight: .semibold))
                     }
+                    .foregroundStyle(QuackTheme.duckOrange)
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: QuackTheme.secondaryButtonHeight)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(QuackTheme.duckOrange.opacity(0.16))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .strokeBorder(QuackTheme.duckOrange.opacity(0.35), lineWidth: 1)
+                            )
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-            ))
-            .labelsHidden()
-            .tint(QuackTheme.duckOrange)
+                .buttonStyle(.quackTouch)
+            }
         }
         .padding(14)
         .quackInsetCard(cornerRadius: 18)
@@ -367,7 +458,11 @@ struct DucksSheetView: View {
                                 .font(QuackTheme.monoValue(size: 11, weight: .medium))
                                 .foregroundStyle(QuackTheme.duckOrange)
                         }
-                        Text(isRowConnecting ? "Connecting..." : (duck.lastIp ?? "No saved IP · connects via Bluetooth"))
+                        let baseDetail = duck.lastIp ?? "No saved IP · connects via Bluetooth"
+                        let detailText = duck.preferences.isCustomSpeedLimit
+                            ? "\(baseDetail) · Max \(String(format: "%.2f", duck.preferences.maxLinearSpeed)) m/s"
+                            : baseDetail
+                        Text(isRowConnecting ? "Connecting..." : detailText)
                             .font(QuackTheme.monoValue(size: 11, weight: .regular))
                             .foregroundStyle(isRowConnecting ? QuackTheme.duckOrange : QuackTheme.creamText.opacity(0.55))
                     }
@@ -393,6 +488,30 @@ struct DucksSheetView: View {
                 .buttonStyle(.quackTouch)
                 .accessibilityLabel("Wi-Fi Setup for \(duck.name)")
             }
+
+            Button {
+                QuackHaptics.light()
+                settingsTarget = .paired(robotId: duck.robotId)
+            } label: {
+                Image(systemName: QuackIcon.settings)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(
+                        isCurrent || duck.preferences.isCustomSpeedLimit
+                            ? QuackTheme.duckOrange
+                            : QuackTheme.creamText.opacity(0.75)
+                    )
+                    .frame(width: QuackTheme.minTouchTarget, height: QuackTheme.minTouchTarget)
+                    .background(
+                        Circle().fill(
+                            isCurrent || duck.preferences.isCustomSpeedLimit
+                                ? QuackTheme.duckOrange.opacity(0.16)
+                                : QuackTheme.creamText.opacity(0.08)
+                        )
+                    )
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.quackTouch)
+            .accessibilityLabel("Settings for \(duck.name)")
 
             Button {
                 duckPendingForget = duck

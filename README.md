@@ -53,6 +53,7 @@ QuackDeck pairs an adaptive SwiftUI iPhone cockpit (Portrait and Landscape) with
 - **Adaptive touch cockpit:** No gamepad required — virtual drive thumbstick, zero-delay turn rocker, drag-to-look head aiming, physical left/right **Kick L** & **Kick R** actions in Portrait (`P3`) and Landscape (`L2`), and state-driven posture controls (`Init`, `Walk`, `Hold`, `Sit`, `Stand`, `Relax`, `Shut Down`).
 - **Dynamic robot emotions:** Discovers available emotion skills from the daemon (`SubscribeResult.skills` minus policy skills) and triggers `robot.do` animations in `U5 Walking` and `U6b Seated` via a floating auto-closing glass **Emote** picker (with `May sit` badges on posture-changing emotions like `devastated`).
 - **Secure onboarding & reconnect:** CoreBluetooth discovery, `md1:` QR / setup-code pairing with `Noise_NNpsk0` encryption, Wi-Fi provisioning, and bounded-backoff LAN auto-reconnect.
+- **Per-robot preferences & speaker audio:** Configure each paired duck's top walk speed (`0.05–0.30 m/s`, saved locally per duck) and adjust the robot's speaker volume (`0–100%`, mute, and `Test Quack` via `robot.volume` / `robot.setVolume`) from **My Ducks → Duck Settings**.
 - **Live telemetry dashboard:** 8×8 ToF depth heatmap, body & head IMU attitude, battery & system health, and 15-joint load/tracking-error grid.
 - **Offline Demo Mode:** Simulate video, ToF, IMUs, joints, all 13 default emotions, and full posture/shutdown lifecycles without hardware.
 
