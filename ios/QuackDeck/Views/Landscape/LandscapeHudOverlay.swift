@@ -493,8 +493,13 @@ struct LandscapeHudOverlay: View {
     }
 
     private var stickSpeedText: String {
-        let vx = appState.stickForward * LiveRobotSession.maxLinearSpeed
-        let vy = appState.stickStrafeLeft * LiveRobotSession.maxLinearSpeed
-        return String(format: "%.2f M/S", hypot(vx, vy))
+        let maxLinear = appState.activeMaxLinearSpeed
+        let vx = appState.stickForward * maxLinear
+        let vy = appState.stickStrafeLeft * maxLinear
+        let speed = hypot(vx, vy)
+        if appState.activeDuckPreferences.isCustomSpeedLimit {
+            return String(format: "%.2f / %.2f M/S", speed, maxLinear)
+        }
+        return String(format: "%.2f M/S", speed)
     }
 }

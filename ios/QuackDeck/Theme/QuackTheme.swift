@@ -56,6 +56,15 @@ enum QuackIcon {
     static let licenses = "doc.text"
     static let delete = "trash"
     static let close = "xmark"
+    static let settings = "gearshape"
+
+    static let volumeMuted = "speaker.slash"
+    static let volumeLow = "speaker.wave.1"
+    static let volumeMedium = "speaker.wave.2"
+    static let volumeHigh = "speaker.wave.3"
+    static let soundTest = "waveform"
+    static let minus = "minus"
+    static let plus = "plus"
 
     static let chevronUp = "chevron.up"
     static let chevronDown = "chevron.down"

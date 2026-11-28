@@ -32,7 +32,7 @@ QuackDeck is a native iPhone app for Microduck-compatible robots, including offi
 | `ios/QuackDeck/Storage/` | `RobotVault.swift` (Keychain PSK storage + `UserDefaults` paired-duck index) |
 | `ios/QuackDeck/Theme/` | `QuackTheme.swift` (color tokens, glass modifiers, halftone dots, haptics) |
 | `ios/QuackDeck/Transport/` | `RobotTransport.swift`, `BleManager.swift`, `WebRTCSession.swift`, `LiveRobotSession.swift`, `DemoRobotSession.swift` |
-| `ios/QuackDeck/Views/` | `RootView.swift` (`--sensors`, `--landscape`), `Portrait/`, `Landscape/`, `Video/`, `Controls/`, `Sensors/`, `Pairing/` |
+| `ios/QuackDeck/Views/` | `RootView.swift` (`--sensors`, `--landscape`), `Portrait/`, `Landscape/`, `Video/`, `Controls/`, `Sensors/`, `Pairing/` (including `DuckSettingsView.swift`) |
 | `ios/QuackDeckTests/` | `CoreBridgeTests.swift`, `ProtoModelsTests.swift`, `DemoSessionTests.swift`, `CockpitStateTests.swift`, `LegalNoticesTests.swift` |
 
 ## Protocol and hardware invariants
@@ -54,7 +54,8 @@ Do not break these invariants when changing transports, WebRTC, or UI:
    - `:9443` (`LanSignallingClient` in `rust/quackdeck-core/src/lan_signalling.rs`): `tokio::io::duplex` + `tokio-tungstenite` WebSocket signalling (`welcome` -> `list` -> `startSession` -> `sessionStarted` -> SDP offer/answer + ICE candidates, empty `iceServers` on LAN).
    - The robot opens the `"control"` datachannel; QuackDeck waits for `peerConnection(_:didOpen:)` and polls `inbound-rtp` stats every 500 ms, auto-reconnecting if decoded frames stall for `> 1000 ms`.
 6. **Drive, gaze, and adaptive telemetry:**
-   - `robot.move`: resent at 10 Hz while non-zero (`maxLinearSpeed = 0.3`, `maxAngularSpeed = 1.5`), with immediate `{0, 0, 0}` on finger release (robot enforces a 500 ms deadman).
+   - `robot.move`: resent at 10 Hz while non-zero (linear velocity capped per paired duck via `DuckPreferences.maxLinearSpeed` in `0.05...0.30` m/s, default `0.30`; `maxAngularSpeed = 1.5`), with immediate `{0, 0, 0}` on finger release (robot enforces a 500 ms deadman).
+   - Speaker audio (`robot.volume`, `robot.setVolume`, `robot.sound`): queried on WebRTC control open or BLE/`:9444` connect and adjusted from `My Ducks` -> `Duck Settings` (`DuckSettingsView.swift`) with slider-release persistence, Mute/Unmute, `±10%` steps, and `Test Quack`. Handles `applies: false` and older daemons (`-32601`/`14` -> `.unsupported`).
    - `robot.look`: resent at 10 Hz while dragging (`x: 1.0`, `y` in `±0.7`, `z` in `0.2 ± 0.45`, `neck_pitch: 0`), showing a `Limit` badge when `clamped: true`.
    - Emotions (`robot.do { "skill": "<emotion_name>" }`): discovered dynamically via `MicroduckEmotions.discover(subscribeAck:policies:)` (`SubscribeResult.skills` minus `PoliciesResult.skills` and reserved policy skills, empty on older daemons). Triggerable via `AppState.triggerEmotion(_:)` only in `U5 Walking` and `U6b Seated` (`AppState.canTriggerEmotions`); zeroes motion before dispatch, drops overlapping taps client-side with `emotionStatusNote`, and preserves active playback state when `devastated` transitions `U5 -> U6a -> U6b`.
    - **Autonomous kicks (`robot.do { "skill": "kick_left" | "kick_right" }`):** Discovered from `PoliciesResult.slots`/`PoliciesResult.skills` via `MicroduckKicks.discover` (`0.5 s` non-chaining one-shots). Triggerable via `AppState.triggerKick(_:)` only in `U5 Walking`; `CockpitState.layoutProjected(hasSitstand:)` projects brief kick execution onto `.walking` so driving controls, `STOP`, and the posture bar never tear down mid-kick while stick/turn/gaze input stays inhibited until completion.

@@ -499,4 +499,113 @@ final class DemoSessionTests: XCTestCase {
 
         await demo.disconnect()
     }
+
+    func testPerDuckTopSpeedCapsMoveWithoutChangingTurnSpeed() async throws {
+        let suiteName = "quackdeck.speedTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let vault = RobotVault(
+            keychainService: "com.caricio.quackdeck.speedTests.\(UUID().uuidString)",
+            defaultsKey: "pairedDucks.\(UUID().uuidString)",
+            defaults: defaults
+        )
+        let psk = String(repeating: "ef", count: 32)
+        defer {
+            try? vault.remove(robotId: "duck-1")
+            try? vault.remove(robotId: "duck-2")
+        }
+
+        try vault.save(duck: PairedDuck(robotId: "duck-1", name: "One"), pskHex: psk)
+        try vault.save(duck: PairedDuck(robotId: "duck-2", name: "Two"), pskHex: psk)
+
+        let appState = AppState(vault: vault, defaults: defaults)
+        appState.updateMaxLinearSpeed(0.15, for: "duck-1")
+        appState.updateMaxLinearSpeed(0.20, for: "duck-2")
+        XCTAssertEqual(appState.preferences(for: "duck-1").maxLinearSpeed, 0.15, accuracy: 0.0001)
+        XCTAssertEqual(appState.preferences(for: "duck-2").maxLinearSpeed, 0.20, accuracy: 0.0001)
+
+        appState.startDemoMode(startWalking: true)
+        defer {
+            Task { @MainActor in
+                await appState.disconnect()
+            }
+        }
+
+        // Default speed cap is 0.30 m/s
+        appState.updateDriveStick(forward: 1.0, strafeLeft: 0.0)
+        appState.updateTurnRocker(yawLeft: 1.0)
+        let sawDefaultMove = try await waitUntil(timeoutSeconds: 1.0) {
+            let req = appState.telemetry.robotState?.movement.requested ?? []
+            return req.count == 3 && abs(req[0] - 0.30) < 0.001 && abs(req[2] - 1.50) < 0.001
+        }
+        XCTAssertTrue(sawDefaultMove, "Got \(appState.telemetry.robotState?.movement.requested ?? [])")
+
+        // Updating active duck top speed to 0.15 m/s updates live drive immediately while turn stays 1.50 rad/s
+        appState.updateMaxLinearSpeed(0.15, for: "demo-duck")
+        let sawSlowMove = try await waitUntil(timeoutSeconds: 1.0) {
+            let req = appState.telemetry.robotState?.movement.requested ?? []
+            return req.count == 3 && abs(req[0] - 0.15) < 0.001 && abs(req[2] - 1.50) < 0.001
+        }
+        XCTAssertTrue(sawSlowMove, "Got \(appState.telemetry.robotState?.movement.requested ?? [])")
+
+        appState.updateMaxLinearSpeed(0.20, for: "demo-duck")
+        let sawMedMove = try await waitUntil(timeoutSeconds: 1.0) {
+            let req = appState.telemetry.robotState?.movement.requested ?? []
+            return req.count == 3 && abs(req[0] - 0.20) < 0.001 && abs(req[2] - 1.50) < 0.001
+        }
+        XCTAssertTrue(sawMedMove, "Got \(appState.telemetry.robotState?.movement.requested ?? [])")
+
+        appState.resetPreferences(for: "demo-duck")
+        let sawResetMove = try await waitUntil(timeoutSeconds: 1.0) {
+            let req = appState.telemetry.robotState?.movement.requested ?? []
+            return req.count == 3 && abs(req[0] - 0.30) < 0.001 && abs(req[2] - 1.50) < 0.001
+        }
+        XCTAssertTrue(sawResetMove, "Got \(appState.telemetry.robotState?.movement.requested ?? [])")
+
+        await appState.disconnect()
+    }
+
+    func testSpeakerVolumeAndTestQuackWhileLimp() async throws {
+        let appState = AppState()
+        appState.startDemoMode(startWalking: false)
+        defer {
+            Task { @MainActor in
+                await appState.disconnect()
+            }
+        }
+
+        XCTAssertEqual(appState.cockpitState, .limp(fallen: false))
+        XCTAssertEqual(appState.telemetry.volumeStatus, .loaded(VolumeResult(volume: 75, applies: true)))
+
+        let updated = try await appState.setSpeakerVolume(40)
+        XCTAssertEqual(updated, VolumeResult(volume: 40, applies: true))
+        XCTAssertEqual(appState.telemetry.volumeStatus, .loaded(VolumeResult(volume: 40, applies: true)))
+
+        let muted = try await appState.setSpeakerVolume(0)
+        XCTAssertEqual(muted, VolumeResult(volume: 0, applies: true))
+
+        // Test Quack works even when motors are off (U2 Limp)
+        await appState.playTestQuack()
+        XCTAssertNotNil(appState.demoSessionInstance?.lastQuackAt)
+        XCTAssertEqual(appState.telemetry.statusBanner, "Quack! (Muted)")
+
+        // No-mixer hardware reports applies == false
+        appState.demoSessionInstance?.simulateVolumeSupport(supported: true, applies: false, volume: 65)
+        XCTAssertEqual(appState.telemetry.volumeStatus, .loaded(VolumeResult(volume: 65, applies: false)))
+
+        // Older daemon reports .unsupported
+        appState.demoSessionInstance?.simulateVolumeSupport(supported: false)
+        XCTAssertEqual(appState.telemetry.volumeStatus, .unsupported)
+        do {
+            _ = try await appState.setSpeakerVolume(50)
+            XCTFail("Expected unsupported volume write to throw")
+        } catch {
+            XCTAssertTrue(LiveRobotSession.isUnsupportedVolumeRpcError(error))
+        }
+
+        XCTAssertTrue(LiveRobotSession.isUnsupportedVolumeRpcError(WebRTCSessionError.controlRpcError(code: -32601, message: "Method not found")))
+        XCTAssertTrue(LiveRobotSession.isUnsupportedVolumeRpcError(BleManagerError.rpcError(code: 14, message: "Permission denied")))
+
+        await appState.disconnect()
+    }
 }

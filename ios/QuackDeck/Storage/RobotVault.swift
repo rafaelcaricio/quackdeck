@@ -107,6 +107,19 @@ final class RobotVault: @unchecked Sendable {
         writeIndexLocked(list)
     }
 
+    func updatePreferences(robotId: String, preferences: DuckPreferences) {
+        lock.lock()
+        defer { lock.unlock() }
+        let read = readIndexLocked()
+        if read.decodeFailed && read.ducks.isEmpty {
+            return
+        }
+        var list = read.ducks
+        guard let idx = list.firstIndex(where: { $0.robotId == robotId }) else { return }
+        list[idx].preferences = DuckPreferences(maxLinearSpeed: preferences.maxLinearSpeed)
+        writeIndexLocked(list)
+    }
+
     func pskHex(for robotId: String) throws -> String? {
         lock.lock()
         defer { lock.unlock() }

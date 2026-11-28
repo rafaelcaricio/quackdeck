@@ -482,9 +482,13 @@ struct PortraitLiveView: View {
     }
 
     private var velocitySummaryText: String {
-        let vx = appState.stickForward * LiveRobotSession.maxLinearSpeed
-        let vy = appState.stickStrafeLeft * LiveRobotSession.maxLinearSpeed
+        let maxLinear = appState.activeMaxLinearSpeed
+        let vx = appState.stickForward * maxLinear
+        let vy = appState.stickStrafeLeft * maxLinear
         let speed = hypot(vx, vy)
+        if appState.activeDuckPreferences.isCustomSpeedLimit {
+            return String(format: "%.2f / %.2f m/s · Drag video to look", speed, maxLinear)
+        }
         return String(format: "%.2f m/s · Drag video to look", speed)
     }
 }

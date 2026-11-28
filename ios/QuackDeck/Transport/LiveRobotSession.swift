@@ -86,6 +86,8 @@ final class LiveRobotSession: RobotSessionTransport {
     private var lastObservedPolicy: String?
     private var policiesFetchSeq: UInt64 = 0
     private var appliedPoliciesSeq: UInt64 = 0
+    private var volumeRpcSeq: UInt64 = 0
+    private var appliedVolumeRpcSeq: UInt64 = 0
 
     // 10 Hz continuous motion & look loops
     private var moveVector: (vx: Double, vy: Double, vyaw: Double) = (0, 0, 0)
@@ -141,7 +143,8 @@ final class LiveRobotSession: RobotSessionTransport {
             lastIp: existing?.lastIp,
             peripheralId: peripheralId,
             pairedAt: existing?.pairedAt ?? Date(),
-            lastConnectedAt: existing?.lastConnectedAt
+            lastConnectedAt: existing?.lastConnectedAt,
+            preferences: existing?.preferences ?? DuckPreferences()
         )
         prepareNewConnectionAttempt(
             duck: duck,
@@ -509,6 +512,106 @@ final class LiveRobotSession: RobotSessionTransport {
         _ = try? await webRTC.call(method: "robot.sound", params: ["tag": "chirp"])
     }
 
+    func refreshVolume() async {
+        guard webRTC.isControlOpen
+                || bleManager.isAuthenticated
+                || (currentIpAddress != nil && currentRobotId != nil && pskHex != nil) else {
+            return
+        }
+
+        volumeRpcSeq &+= 1
+        let seq = volumeRpcSeq
+        let generation = connectGeneration
+
+        if telemetry.volumeStatus == .unknown {
+            telemetry.volumeStatus = .loading
+            onStateUpdated?()
+        }
+
+        do {
+            let data = try await callVolumeRpc(method: "robot.volume", timeoutSeconds: 5)
+            guard connectGeneration == generation, seq >= appliedVolumeRpcSeq else { return }
+            let result = try JSONDecoder().decode(VolumeResult.self, from: data)
+            appliedVolumeRpcSeq = seq
+            telemetry.volumeStatus = .loaded(result)
+            onStateUpdated?()
+        } catch {
+            guard connectGeneration == generation, seq >= appliedVolumeRpcSeq else { return }
+            if Self.isUnsupportedVolumeRpcError(error) {
+                appliedVolumeRpcSeq = seq
+                telemetry.volumeStatus = .unsupported
+            } else if telemetry.volumeStatus.currentVolume == nil {
+                telemetry.volumeStatus = .failed(error.localizedDescription)
+            }
+            onStateUpdated?()
+        }
+    }
+
+    func setSpeakerVolume(_ volume: UInt8) async throws -> VolumeResult {
+        let clamped = min(100, volume)
+        volumeRpcSeq &+= 1
+        let seq = volumeRpcSeq
+        let generation = connectGeneration
+
+        do {
+            let data = try await callVolumeRpc(
+                method: "robot.setVolume",
+                params: ["volume": Int(clamped)],
+                timeoutSeconds: 6
+            )
+            let result = try JSONDecoder().decode(VolumeResult.self, from: data)
+            if connectGeneration == generation && seq >= appliedVolumeRpcSeq {
+                appliedVolumeRpcSeq = seq
+                telemetry.volumeStatus = .loaded(result)
+                onStateUpdated?()
+            }
+            return result
+        } catch {
+            if connectGeneration == generation,
+               seq >= appliedVolumeRpcSeq,
+               Self.isUnsupportedVolumeRpcError(error) {
+                appliedVolumeRpcSeq = seq
+                telemetry.volumeStatus = .unsupported
+                onStateUpdated?()
+            }
+            throw error
+        }
+    }
+
+    func playTestQuack() async {
+        if webRTC.isControlOpen {
+            _ = try? await webRTC.call(method: "robot.sound", params: ["tag": "chirp"], timeoutSeconds: 5)
+            return
+        }
+        _ = try? await callProvisioningRpc(method: "robot.sound", params: ["tag": "chirp"], timeoutSeconds: 5)
+    }
+
+    private func callVolumeRpc(
+        method: String,
+        params: [String: Any] = [:],
+        timeoutSeconds: TimeInterval
+    ) async throws -> Data {
+        if webRTC.isControlOpen {
+            return try await webRTC.call(method: method, params: params, timeoutSeconds: timeoutSeconds)
+        }
+        let raw = try await callProvisioningRpc(method: method, params: params, timeoutSeconds: timeoutSeconds)
+        guard let data = raw.data(using: .utf8) else {
+            throw QuackCoreError.invalidResponse("Non-UTF8 JSON payload")
+        }
+        return data
+    }
+
+    static func isUnsupportedVolumeRpcError(_ error: Error) -> Bool {
+        switch error {
+        case WebRTCSessionError.controlRpcError(let code, let message):
+            return code == -32601 || code == 14 || message.lowercased().contains("method not found")
+        case BleManagerError.rpcError(let code, let message):
+            return code == -32601 || code == 14 || message.lowercased().contains("method not found")
+        default:
+            return false
+        }
+    }
+
     func scanWifiNetworks() async throws -> [WifiNetwork] {
         let raw = try await callProvisioningRpc(method: "net.scan", timeoutSeconds: 20)
         let result = try decodeJSON(NetScanResult.self, from: raw)
@@ -792,7 +895,10 @@ final class LiveRobotSession: RobotSessionTransport {
             lastIp: ipAddress ?? targetDuck?.lastIp,
             peripheralId: peripheralId,
             pairedAt: vault.pairedDuck(for: robotId)?.pairedAt ?? targetDuck?.pairedAt ?? Date(),
-            lastConnectedAt: Date()
+            lastConnectedAt: Date(),
+            preferences: vault.pairedDuck(for: robotId)?.preferences
+                ?? targetDuck?.preferences
+                ?? DuckPreferences()
         )
         targetDuck = savedDuck
         try? vault.save(duck: savedDuck, pskHex: pskHex)
@@ -816,6 +922,9 @@ final class LiveRobotSession: RobotSessionTransport {
             telemetry.isAutoReconnecting = false
             telemetry.statusBanner = "Connected over Bluetooth. Configure Wi-Fi for live video and control."
             onStateUpdated?()
+            Task { @MainActor [weak self] in
+                await self?.refreshVolume()
+            }
         }
     }
 
@@ -1501,6 +1610,7 @@ final class LiveRobotSession: RobotSessionTransport {
             self.telemetry.lastHealthUptime = nil
             self.telemetry.isVideoFirstFrameTimedOut = false
             self.telemetry.shutdownOutcome = .none
+            self.telemetry.volumeStatus = .unknown
 
             self.phase = .connected(transportLabel: "LAN")
             self.onStateUpdated?()
@@ -1534,6 +1644,7 @@ final class LiveRobotSession: RobotSessionTransport {
             self.telemetry.isHealthStale = false
             self.telemetry.lastRobotStateUptime = nil
             self.telemetry.lastHealthUptime = nil
+            self.telemetry.volumeStatus = .unknown
             if self.phase.isConnected {
                 self.phase = .connectingVideo
             }
@@ -1657,6 +1768,7 @@ final class LiveRobotSession: RobotSessionTransport {
             async let modelCall: Void = self.fetchRobotModel()
             async let tofCall: Void = self.startTofStream()
             async let headImuCall: Void = self.startHeadImuIfNeeded()
+            async let volumeCall: Void = self.refreshVolume()
 
             _ = await (
                 healthCall,
@@ -1666,7 +1778,8 @@ final class LiveRobotSession: RobotSessionTransport {
                 sysCall,
                 modelCall,
                 tofCall,
-                headImuCall
+                headImuCall,
+                volumeCall
             )
             guard !Task.isCancelled, self.webRTC.isControlOpen else { return }
             self.startHealthLoop()
@@ -1949,7 +2062,7 @@ final class LiveRobotSession: RobotSessionTransport {
 
     private func isIdempotentProvisioningRead(_ method: String) -> Bool {
         switch method {
-        case "net.status", "net.scan", "system.info", "robot.health":
+        case "net.status", "net.scan", "system.info", "robot.health", "robot.volume":
             return true
         default:
             return false
